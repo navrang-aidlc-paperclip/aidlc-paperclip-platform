@@ -1,0 +1,96 @@
+name: Build conductor image
+
+on:
+  push:
+    branches: [main]
+    paths: ["conductor/**", ".github/workflows/build-conductor.yml"]
+  workflow_dispatch:
+    inputs:
+      aidlc_version:
+        description: AI-DLC release to bake in (must equal aidlc-workspace/.aidlc-version)
+        default: "2.11.0"
+      paperclip_tag:
+        description: ghcr.io/paperclipai/paperclip tag
+        default: "latest"
+      deploy:
+        description: Roll the ECS service to the new image
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: eu-central-1
+  ECR_REPOSITORY: aidlc-conductor
+  CLUSTER: aidlc-paperclip
+  SERVICE: aidlc-paperclip
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_IMAGE_PUSH_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - id: meta
+        run: |
+          AIDLC_VERSION="${{ inputs.aidlc_version || '2.11.0' }}"
+          TAG="${AIDLC_VERSION}-${GITHUB_SHA::7}"
+          echo "aidlc_version=$AIDLC_VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "image=${{ steps.ecr.outputs.registry }}/${ECR_REPOSITORY}:${TAG}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: conductor
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.image }}
+          build-args: |
+            AIDLC_VERSION=${{ steps.meta.outputs.aidlc_version }}
+            PAPERCLIP_TAG=${{ inputs.paperclip_tag || 'latest' }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - run: |
+          echo "### Image" >> "$GITHUB_STEP_SUMMARY"
+          echo '`${{ steps.meta.outputs.image }}`' >> "$GITHUB_STEP_SUMMARY"
+          echo "Deploy: IMAGE=${{ steps.meta.outputs.image }} ./cloudformation/deploy.sh paperclip" >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    if: ${{ inputs.deploy }}
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_IMAGE_PUSH_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Re-register the current task definition with the new image and roll
+      # the service; the CloudFormation stack is updated to match on the next
+      # `deploy.sh paperclip` (drift is only the image tag).
+      - run: |
+          set -euo pipefail
+          td_arn=$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" --query 'services[0].taskDefinition' --output text)
+          aws ecs describe-task-definition --task-definition "$td_arn" --query 'taskDefinition' \
+            | jq --arg img "${{ needs.build.outputs.image }}" '
+                .containerDefinitions[0].image = $img
+                | del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy)' \
+            > td.json
+          new_arn=$(aws ecs register-task-definition --cli-input-json file://td.json --query 'taskDefinition.taskDefinitionArn' --output text)
+          aws ecs update-service --cluster "$CLUSTER" --service "$SERVICE" --task-definition "$new_arn" >/dev/null
+          aws ecs wait services-stable --cluster "$CLUSTER" --services "$SERVICE"

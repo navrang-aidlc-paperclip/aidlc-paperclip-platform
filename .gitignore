@@ -1,0 +1,8 @@
+# deployment inputs with secrets
+cloudformation/deploy.env
+cloudformation/secrets/
+*.pem
+
+# local scratch
+.DS_Store
+td.json

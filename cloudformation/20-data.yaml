@@ -1,0 +1,243 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  aidlc-platform / data: RDS Postgres 17, EFS for /paperclip, S3 for run logs,
+  ECR for the conductor image, and every secret the Paperclip task reads
+  (DATABASE_URL, BETTER_AUTH_SECRET, tool-action signing secret, GitHub App
+  credentials, Entra client secret).
+
+Parameters:
+  Name:
+    Type: String
+    Default: aidlc
+  DbInstanceClass:
+    Type: String
+    Default: db.t4g.medium
+  DbAllocatedStorage:
+    Type: Number
+    Default: 50
+  DbEngineVersion:
+    Type: String
+    Default: "17.9"
+    Description: Postgres 17.x minor. Check `aws rds describe-db-engine-versions --engine postgres --query 'DBEngineVersions[].EngineVersion'`.
+  GitHubAppId:
+    Type: String
+    Description: GitHub App id (see docs/github-app.md)
+  GitHubAppInstallationId:
+    Type: String
+  GitHubAppPrivateKeyPem:
+    Type: String
+    NoEcho: true
+    Description: GitHub App private key PEM. Pass with --parameter-overrides from a file, never commit.
+  EntraClientSecret:
+    Type: String
+    NoEcho: true
+    Description: Entra ID app registration client secret used by the ALB OIDC action.
+
+Resources:
+  # ------------------------------------------------------------------ RDS
+  DbMasterSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${Name}/paperclip/db-master"
+      GenerateSecretString:
+        SecretStringTemplate: '{"username":"paperclip"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludePunctuation: true
+
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Paperclip private subnets
+      SubnetIds: !Split [",", !ImportValue { "Fn::Sub": "${Name}-PrivateSubnetIds" }]
+
+  Db:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub "${Name}-paperclip"
+      Engine: postgres
+      EngineVersion: !Ref DbEngineVersion
+      DBInstanceClass: !Ref DbInstanceClass
+      AllocatedStorage: !Ref DbAllocatedStorage
+      StorageType: gp3
+      StorageEncrypted: true
+      DBName: paperclip
+      MasterUsername: !Sub "{{resolve:secretsmanager:${DbMasterSecret}:SecretString:username}}"
+      MasterUserPassword: !Sub "{{resolve:secretsmanager:${DbMasterSecret}:SecretString:password}}"
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups:
+        - !ImportValue { "Fn::Sub": "${Name}-RdsSgId" }
+      PubliclyAccessible: false
+      MultiAZ: false # pilot
+      BackupRetentionPeriod: 7
+      DeletionProtection: true
+      AutoMinorVersionUpgrade: true
+
+  DbSecretAttachment:
+    Type: AWS::SecretsManager::SecretTargetAttachment
+    Properties:
+      SecretId: !Ref DbMasterSecret
+      TargetId: !Ref Db
+      TargetType: AWS::RDS::DBInstance
+
+  # Paperclip wants one DATABASE_URL string. Build it from the generated
+  # password and the instance endpoint.
+  DatabaseUrlSecret:
+    Type: AWS::SecretsManager::Secret
+    DependsOn: DbSecretAttachment
+    Properties:
+      Name: !Sub "${Name}/paperclip/database-url"
+      SecretString: !Sub
+        - "postgres://paperclip:${Password}@${Host}:5432/paperclip"
+        - Password: !Sub "{{resolve:secretsmanager:${DbMasterSecret}:SecretString:password}}"
+          Host: !GetAtt Db.Endpoint.Address
+
+  # ------------------------------------------------------------------ Paperclip app secrets
+  BetterAuthSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${Name}/paperclip/better-auth-secret"
+      GenerateSecretString:
+        PasswordLength: 48
+        ExcludePunctuation: true
+
+  ToolActionSigningSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${Name}/paperclip/tool-action-signing-secret"
+      GenerateSecretString:
+        PasswordLength: 48
+        ExcludePunctuation: true
+
+  GitHubAppIdSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${Name}/github-app/id"
+      SecretString: !Ref GitHubAppId
+
+  GitHubAppInstallationIdSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${Name}/github-app/installation-id"
+      SecretString: !Ref GitHubAppInstallationId
+
+  GitHubAppPrivateKeySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${Name}/github-app/private-key"
+      SecretString: !Ref GitHubAppPrivateKeyPem
+
+  EntraClientSecretSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${Name}/entra/client-secret"
+      SecretString: !Ref EntraClientSecret
+
+  # ------------------------------------------------------------------ EFS (/paperclip)
+  # Holds Paperclip's instance config, the Claude session store, and the
+  # aidlc-workspace checkout + sibling repos under /paperclip/workspaces.
+  FileSystem:
+    Type: AWS::EFS::FileSystem
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Encrypted: true
+      PerformanceMode: generalPurpose
+      ThroughputMode: elastic
+      LifecyclePolicies:
+        - TransitionToIA: AFTER_30_DAYS
+      FileSystemTags:
+        - { Key: Name, Value: !Sub "${Name}-paperclip" }
+
+  MountTargetA:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref FileSystem
+      SubnetId: !ImportValue { "Fn::Sub": "${Name}-PrivateSubnetA" }
+      SecurityGroups: [!ImportValue { "Fn::Sub": "${Name}-EfsSgId" }]
+  MountTargetB:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref FileSystem
+      SubnetId: !ImportValue { "Fn::Sub": "${Name}-PrivateSubnetB" }
+      SecurityGroups: [!ImportValue { "Fn::Sub": "${Name}-EfsSgId" }]
+
+  AccessPoint:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref FileSystem
+      PosixUser: { Uid: "1000", Gid: "1000" }
+      RootDirectory:
+        Path: /paperclip
+        CreationInfo: { OwnerUid: "1000", OwnerGid: "1000", Permissions: "0755" }
+
+  # ------------------------------------------------------------------ S3 run logs
+  RunLogBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "${Name}-paperclip-runlogs-${AWS::AccountId}"
+      VersioningConfiguration: { Status: Enabled }
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # ------------------------------------------------------------------ ECR
+  ConductorRepository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RepositoryName: !Sub "${Name}-conductor"
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration: { ScanOnPush: true }
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {"rules":[{"rulePriority":1,"description":"keep last 20",
+            "selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":20},
+            "action":{"type":"expire"}}]}
+
+Outputs:
+  DatabaseUrlSecretArn:
+    Value: !Ref DatabaseUrlSecret
+    Export: { Name: !Sub "${Name}-DatabaseUrlSecretArn" }
+  BetterAuthSecretArn:
+    Value: !Ref BetterAuthSecret
+    Export: { Name: !Sub "${Name}-BetterAuthSecretArn" }
+  ToolActionSigningSecretArn:
+    Value: !Ref ToolActionSigningSecret
+    Export: { Name: !Sub "${Name}-ToolActionSigningSecretArn" }
+  GitHubAppIdSecretArn:
+    Value: !Ref GitHubAppIdSecret
+    Export: { Name: !Sub "${Name}-GitHubAppIdSecretArn" }
+  GitHubAppInstallationIdSecretArn:
+    Value: !Ref GitHubAppInstallationIdSecret
+    Export: { Name: !Sub "${Name}-GitHubAppInstallationIdSecretArn" }
+  GitHubAppPrivateKeySecretArn:
+    Value: !Ref GitHubAppPrivateKeySecret
+    Export: { Name: !Sub "${Name}-GitHubAppPrivateKeySecretArn" }
+  EntraClientSecretArn:
+    Value: !Ref EntraClientSecretSecret
+    Export: { Name: !Sub "${Name}-EntraClientSecretArn" }
+  FileSystemId:
+    Value: !Ref FileSystem
+    Export: { Name: !Sub "${Name}-FileSystemId" }
+  AccessPointId:
+    Value: !Ref AccessPoint
+    Export: { Name: !Sub "${Name}-AccessPointId" }
+  RunLogBucketName:
+    Value: !Ref RunLogBucket
+    Export: { Name: !Sub "${Name}-RunLogBucket" }
+  ConductorRepositoryUri:
+    Value: !GetAtt ConductorRepository.RepositoryUri
+    Export: { Name: !Sub "${Name}-ConductorRepositoryUri" }
+  DbEndpoint:
+    Value: !GetAtt Db.Endpoint.Address

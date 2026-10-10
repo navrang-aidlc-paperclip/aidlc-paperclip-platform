@@ -1,0 +1,483 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  aidlc-platform / paperclip: ECS Fargate service running the Paperclip +
+  AI-DLC conductor image behind an ALB that authenticates every request with
+  Microsoft Entra ID (OIDC). Task role grants Bedrock, EFS, S3 run logs and
+  ECS Exec. Also creates the GitHub Actions OIDC role that pushes images.
+
+Parameters:
+  Name:
+    Type: String
+    Default: aidlc
+  Image:
+    Type: String
+    Description: Full ECR image URI incl. tag, e.g. 123.dkr.ecr.eu-central-1.amazonaws.com/aidlc-conductor:2.11.0-abc123
+  Cpu:
+    Type: Number
+    Default: 2048
+  Memory:
+    Type: Number
+    Default: 8192
+  DesiredCount:
+    Type: Number
+    Default: 1
+    Description: 1 for the pilot. Set 0 to scale to zero overnight.
+  Domain:
+    Type: String
+    Description: FQDN of the board, e.g. aidlc.corp.example.com
+  HostedZoneId:
+    Type: String
+    Default: ""
+    Description: Route53 zone id for Domain. Empty = DNS and ACM validation records are created by hand.
+  EntraTenantId:
+    Type: String
+  EntraClientId:
+    Type: String
+    Description: App registration client id. Redirect URI must be https://<Domain>/oauth2/idpresponse
+  DisableSignUp:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Set true after the first Owner signed up.
+  BedrockPrimaryModel:
+    Type: String
+    Default: eu.anthropic.claude-opus-4-8-v1:0
+    Description: Verify with `aws bedrock list-inference-profiles --region eu-central-1`
+  BedrockOpusModel:
+    Type: String
+    Default: eu.anthropic.claude-opus-4-8-v1:0
+  BedrockSonnetModel:
+    Type: String
+    Default: eu.anthropic.claude-sonnet-4-6-v1:0
+  BedrockHaikuModel:
+    Type: String
+    Default: eu.anthropic.claude-haiku-4-6-v1:0
+  WorkspaceRepoUrl:
+    Type: String
+    Default: https://github.com/navrang-aidlc-paperclip/aidlc-workspace.git
+  GitHubActionsRepo:
+    Type: String
+    Default: navrang-aidlc-paperclip/aidlc-platform
+    Description: <org>/<repo> allowed to assume the image-push role via GitHub OIDC.
+
+Conditions:
+  HasHostedZone: !Not [!Equals [!Ref HostedZoneId, ""]]
+
+Resources:
+  # ------------------------------------------------------------------ logs
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${Name}-paperclip"
+      RetentionInDays: 90
+
+  # ------------------------------------------------------------------ IAM
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${Name}-paperclip-execution"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: ReadSecrets
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  - !ImportValue { "Fn::Sub": "${Name}-DatabaseUrlSecretArn" }
+                  - !ImportValue { "Fn::Sub": "${Name}-BetterAuthSecretArn" }
+                  - !ImportValue { "Fn::Sub": "${Name}-ToolActionSigningSecretArn" }
+                  - !ImportValue { "Fn::Sub": "${Name}-GitHubAppIdSecretArn" }
+                  - !ImportValue { "Fn::Sub": "${Name}-GitHubAppInstallationIdSecretArn" }
+                  - !ImportValue { "Fn::Sub": "${Name}-GitHubAppPrivateKeySecretArn" }
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${Name}-paperclip-task"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: Bedrock
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Claude Code on Bedrock: invoke + streaming on the allowed
+              # inference profiles and the underlying foundation models they
+              # route to (cross-region profiles need both).
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource:
+                  - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${BedrockPrimaryModel}"
+                  - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${BedrockOpusModel}"
+                  - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${BedrockSonnetModel}"
+                  - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${BedrockHaikuModel}"
+                  - arn:aws:bedrock:*::foundation-model/anthropic.*
+              - Effect: Allow
+                Action:
+                  - bedrock:GetInferenceProfile
+                  - bedrock:ListInferenceProfiles
+                  - bedrock:ListFoundationModels
+                  - bedrock:GetFoundationModel
+                Resource: "*"
+        - PolicyName: Efs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - elasticfilesystem:ClientMount
+                  - elasticfilesystem:ClientWrite
+                  - elasticfilesystem:ClientRootAccess
+                Resource: !Sub
+                  - "arn:aws:elasticfilesystem:${AWS::Region}:${AWS::AccountId}:file-system/${FsId}"
+                  - FsId: !ImportValue { "Fn::Sub": "${Name}-FileSystemId" }
+                Condition:
+                  StringEquals:
+                    elasticfilesystem:AccessPointArn: !Sub
+                      - "arn:aws:elasticfilesystem:${AWS::Region}:${AWS::AccountId}:access-point/${ApId}"
+                      - ApId: !ImportValue { "Fn::Sub": "${Name}-AccessPointId" }
+        - PolicyName: RunLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:PutObject, s3:GetObject, s3:DeleteObject, s3:ListBucket]
+                Resource:
+                  - !Sub
+                    - "arn:aws:s3:::${Bucket}"
+                    - Bucket: !ImportValue { "Fn::Sub": "${Name}-RunLogBucket" }
+                  - !Sub
+                    - "arn:aws:s3:::${Bucket}/*"
+                    - Bucket: !ImportValue { "Fn::Sub": "${Name}-RunLogBucket" }
+        - PolicyName: EcsExec
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssmmessages:CreateControlChannel
+                  - ssmmessages:CreateDataChannel
+                  - ssmmessages:OpenControlChannel
+                  - ssmmessages:OpenDataChannel
+                Resource: "*"
+
+  # ------------------------------------------------------------------ ECS
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${Name}-paperclip"
+      ClusterSettings:
+        - { Name: containerInsights, Value: enabled }
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${Name}-paperclip"
+      Cpu: !Ref Cpu
+      Memory: !Ref Memory
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      RuntimePlatform: { OperatingSystemFamily: LINUX, CpuArchitecture: X86_64 }
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      Volumes:
+        - Name: paperclip-data
+          EFSVolumeConfiguration:
+            FilesystemId: !ImportValue { "Fn::Sub": "${Name}-FileSystemId" }
+            TransitEncryption: ENABLED
+            AuthorizationConfig:
+              AccessPointId: !ImportValue { "Fn::Sub": "${Name}-AccessPointId" }
+              IAM: ENABLED
+      ContainerDefinitions:
+        - Name: paperclip
+          Image: !Ref Image
+          Essential: true
+          PortMappings:
+            - { ContainerPort: 3100, Protocol: tcp }
+          # Paperclip's server + conductor. The volume comes in as uid 1000
+          # through the access point; the image's entrypoint already handles
+          # ownership. Run as root so docker-entrypoint.sh can gosu to node.
+          Environment:
+            - { Name: NODE_ENV, Value: production }
+            - { Name: HOST, Value: 0.0.0.0 }
+            - { Name: PORT, Value: "3100" }
+            - { Name: SERVE_UI, Value: "true" }
+            - { Name: PAPERCLIP_HOME, Value: /paperclip }
+            - { Name: PAPERCLIP_INSTANCE_ID, Value: default }
+            - { Name: PAPERCLIP_CONFIG, Value: /paperclip/instances/default/config.json }
+            - { Name: PAPERCLIP_DEPLOYMENT_MODE, Value: authenticated }
+            - { Name: PAPERCLIP_DEPLOYMENT_EXPOSURE, Value: public }
+            - { Name: PAPERCLIP_PUBLIC_URL, Value: !Sub "https://${Domain}" }
+            - { Name: PAPERCLIP_MIGRATION_AUTO_APPLY, Value: "true" }
+            - { Name: HEARTBEAT_SCHEDULER_ENABLED, Value: "true" }
+            - { Name: PAPERCLIP_AUTH_DISABLE_SIGN_UP, Value: !Ref DisableSignUp }
+            # Run log object store (see Paperclip docs/deploy/storage.md)
+            - { Name: PAPERCLIP_RUN_LOG_STORE, Value: object_store }
+            - { Name: PAPERCLIP_OBJECT_STORE_BUCKET, Value: !ImportValue { "Fn::Sub": "${Name}-RunLogBucket" } }
+            - { Name: PAPERCLIP_OBJECT_STORE_REGION, Value: !Ref "AWS::Region" }
+            # Claude Code on Bedrock
+            - { Name: CLAUDE_CODE_USE_BEDROCK, Value: "1" }
+            - { Name: AWS_REGION, Value: !Ref "AWS::Region" }
+            - { Name: ANTHROPIC_MODEL, Value: !Ref BedrockPrimaryModel }
+            - { Name: ANTHROPIC_DEFAULT_OPUS_MODEL, Value: !Ref BedrockOpusModel }
+            - { Name: ANTHROPIC_DEFAULT_SONNET_MODEL, Value: !Ref BedrockSonnetModel }
+            - { Name: ANTHROPIC_DEFAULT_HAIKU_MODEL, Value: !Ref BedrockHaikuModel }
+            - { Name: DISABLE_PROMPT_CACHING, Value: "0" }
+            # Conductor workspace bootstrap
+            - { Name: AIDLC_WORKSPACES_ROOT, Value: /paperclip/workspaces }
+            - { Name: AIDLC_WORKSPACE_REPO, Value: !Ref WorkspaceRepoUrl }
+            - { Name: AIDLC_WORKSPACE_NAME, Value: aidlc-workspace }
+            - { Name: AIDLC_WORKSPACE_BRANCH, Value: main }
+          Secrets:
+            - { Name: DATABASE_URL, ValueFrom: !ImportValue { "Fn::Sub": "${Name}-DatabaseUrlSecretArn" } }
+            - { Name: BETTER_AUTH_SECRET, ValueFrom: !ImportValue { "Fn::Sub": "${Name}-BetterAuthSecretArn" } }
+            - { Name: PAPERCLIP_TOOL_ACTION_SIGNING_SECRET, ValueFrom: !ImportValue { "Fn::Sub": "${Name}-ToolActionSigningSecretArn" } }
+            - { Name: GITHUB_APP_ID, ValueFrom: !ImportValue { "Fn::Sub": "${Name}-GitHubAppIdSecretArn" } }
+            - { Name: GITHUB_APP_INSTALLATION_ID, ValueFrom: !ImportValue { "Fn::Sub": "${Name}-GitHubAppInstallationIdSecretArn" } }
+            - { Name: GITHUB_APP_PRIVATE_KEY, ValueFrom: !ImportValue { "Fn::Sub": "${Name}-GitHubAppPrivateKeySecretArn" } }
+          MountPoints:
+            - { SourceVolume: paperclip-data, ContainerPath: /paperclip, ReadOnly: false }
+          LinuxParameters:
+            InitProcessEnabled: false # image already runs tini as PID 1
+          HealthCheck:
+            Command: ["CMD-SHELL", "curl -f http://localhost:3100/api/health || exit 1"]
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 120
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref "AWS::Region"
+              awslogs-stream-prefix: paperclip
+
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: HttpsListener
+    Properties:
+      ServiceName: !Sub "${Name}-paperclip"
+      Cluster: !Ref Cluster
+      LaunchType: FARGATE
+      PlatformVersion: "1.4.0"
+      DesiredCount: !Ref DesiredCount
+      TaskDefinition: !Ref TaskDefinition
+      EnableExecuteCommand: true
+      HealthCheckGracePeriodSeconds: 180
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 0   # single task + persistent Claude sessions: replace, don't overlap
+        MaximumPercent: 100
+        DeploymentCircuitBreaker: { Enable: true, Rollback: true }
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: !Split [",", !ImportValue { "Fn::Sub": "${Name}-PrivateSubnetIds" }]
+          SecurityGroups: [!ImportValue { "Fn::Sub": "${Name}-PaperclipSgId" }]
+      LoadBalancers:
+        - ContainerName: paperclip
+          ContainerPort: 3100
+          TargetGroupArn: !Ref TargetGroup
+
+  # ------------------------------------------------------------------ ALB + TLS + OIDC
+  Certificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Ref Domain
+      ValidationMethod: DNS
+      DomainValidationOptions: !If
+        - HasHostedZone
+        - [{ DomainName: !Ref Domain, HostedZoneId: !Ref HostedZoneId }]
+        - !Ref "AWS::NoValue"
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${Name}-paperclip"
+      Scheme: internet-facing
+      Type: application
+      IpAddressType: ipv4
+      Subnets: !Split [",", !ImportValue { "Fn::Sub": "${Name}-PublicSubnetIds" }]
+      SecurityGroups: [!ImportValue { "Fn::Sub": "${Name}-AlbSgId" }]
+      LoadBalancerAttributes:
+        - { Key: idle_timeout.timeout_seconds, Value: "300" } # long-polling run logs
+        - { Key: routing.http.drop_invalid_header_fields.enabled, Value: "true" }
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${Name}-paperclip"
+      VpcId: !ImportValue { "Fn::Sub": "${Name}-VpcId" }
+      Port: 3100
+      Protocol: HTTP
+      TargetType: ip
+      HealthCheckPath: /api/health
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: "30" }
+        - { Key: stickiness.enabled, Value: "true" }
+        - { Key: stickiness.type, Value: lb_cookie }
+
+  HttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      Certificates: [{ CertificateArn: !Ref Certificate }]
+      DefaultActions:
+        # Every request to the board is authenticated with Entra ID first.
+        # Paperclip still has its own accounts; the first sign-up uses the same
+        # corporate e-mail. Set DisableSignUp=true afterwards.
+        - Type: authenticate-oidc
+          Order: 1
+          AuthenticateOidcConfig:
+            Issuer: !Sub "https://login.microsoftonline.com/${EntraTenantId}/v2.0"
+            AuthorizationEndpoint: !Sub "https://login.microsoftonline.com/${EntraTenantId}/oauth2/v2.0/authorize"
+            TokenEndpoint: !Sub "https://login.microsoftonline.com/${EntraTenantId}/oauth2/v2.0/token"
+            UserInfoEndpoint: https://graph.microsoft.com/oidc/userinfo
+            ClientId: !Ref EntraClientId
+            ClientSecret: !Sub
+              - "{{resolve:secretsmanager:${Arn}:SecretString}}"
+              - Arn: !ImportValue { "Fn::Sub": "${Name}-EntraClientSecretArn" }
+            Scope: openid profile email
+            SessionCookieName: AWSELBAuthSessionCookie
+            SessionTimeout: 43200
+            OnUnauthenticatedRequest: authenticate
+        - Type: forward
+          Order: 2
+          TargetGroupArn: !Ref TargetGroup
+
+  # Agent API calls that carry a Paperclip agent key (webhooks, Hermes later,
+  # the conductor itself if it ever runs outside the task) must not be bounced
+  # to the Entra login page. They are authenticated by Paperclip itself.
+  ApiBypassRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref HttpsListener
+      Priority: 10
+      Conditions:
+        - Field: path-pattern
+          Values: ["/api/*"]
+        - Field: http-header
+          HttpHeaderConfig:
+            HttpHeaderName: Authorization
+            Values: ["Bearer *"]
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: redirect
+          RedirectConfig: { Protocol: HTTPS, Port: "443", StatusCode: HTTP_301 }
+
+  DnsRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: HasHostedZone
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref Domain
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt LoadBalancer.DNSName
+        HostedZoneId: !GetAtt LoadBalancer.CanonicalHostedZoneID
+
+  # ------------------------------------------------------------------ GitHub Actions -> ECR
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [sts.amazonaws.com]
+      ThumbprintList: [6938fd4d98bab03faadb97b34396831e3780aea1] # ignored by AWS for GitHub since 2023, required by the schema
+
+  ImagePushRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${Name}-github-image-push"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Federated: !Ref GitHubOidcProvider }
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                token.actions.githubusercontent.com:sub: !Sub "repo:${GitHubActionsRepo}:*"
+      Policies:
+        - PolicyName: PushConductorImage
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:CompleteLayerUpload
+                  - ecr:InitiateLayerUpload
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:DescribeImages
+                Resource: !Sub "arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${Name}-conductor"
+              # Let the workflow roll the service to the new image.
+              - Effect: Allow
+                Action:
+                  - ecs:DescribeServices
+                  - ecs:DescribeTaskDefinition
+                  - ecs:RegisterTaskDefinition
+                  - ecs:UpdateService
+                Resource: "*"
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource:
+                  - !GetAtt ExecutionRole.Arn
+                  - !GetAtt TaskRole.Arn
+
+Outputs:
+  BoardUrl:
+    Value: !Sub "https://${Domain}"
+  LoadBalancerDnsName:
+    Description: Create a CNAME from Domain to this if HostedZoneId was empty.
+    Value: !GetAtt LoadBalancer.DNSName
+  ClusterName:
+    Value: !Ref Cluster
+  ServiceName:
+    Value: !GetAtt Service.Name
+  TaskRoleArn:
+    Value: !GetAtt TaskRole.Arn
+  ImagePushRoleArn:
+    Description: Put in the aidlc-platform GitHub repo as variable AWS_IMAGE_PUSH_ROLE_ARN.
+    Value: !GetAtt ImagePushRole.Arn
+  BedrockModelIds:
+    Description: Values for the ${BEDROCK_*} placeholders in paperclip/agents/aidlc-conductor.json
+    Value: !Sub "primary=${BedrockPrimaryModel} opus=${BedrockOpusModel} sonnet=${BedrockSonnetModel} haiku=${BedrockHaikuModel}"
+  ExecIntoTask:
+    Value: !Sub "aws ecs execute-command --cluster ${Cluster} --task <task-id> --container paperclip --interactive --command bash --region ${AWS::Region}"

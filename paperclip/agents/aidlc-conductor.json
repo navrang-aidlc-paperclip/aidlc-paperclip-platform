@@ -1,0 +1,41 @@
+{
+  "name": "aidlc-conductor",
+  "role": "AI-DLC conductor",
+  "adapterType": "claude_local",
+  "adapterConfig": {
+    "cwd": "/paperclip/workspaces/aidlc-workspace",
+    "mode": "persistent",
+    "model": "",
+    "dangerouslySkipPermissions": true,
+    "maxTurnsPerRun": 300,
+    "timeoutSec": 0,
+    "promptTemplate": "You are {{agent.name}} for {{company.name}}. Follow the aidlc-conductor skill exactly. Run id {{runId}}.",
+    "env": {
+      "CLAUDE_CODE_USE_BEDROCK": "1",
+      "AWS_REGION": "eu-central-1",
+      "ANTHROPIC_MODEL": "${BEDROCK_PRIMARY_MODEL}",
+      "ANTHROPIC_DEFAULT_OPUS_MODEL": "${BEDROCK_OPUS_MODEL}",
+      "ANTHROPIC_DEFAULT_SONNET_MODEL": "${BEDROCK_SONNET_MODEL}",
+      "ANTHROPIC_DEFAULT_HAIKU_MODEL": "${BEDROCK_HAIKU_MODEL}",
+      "DISABLE_PROMPT_CACHING": "0",
+      "GITHUB_APP_ID": { "secretRef": "github-app-id" },
+      "GITHUB_APP_INSTALLATION_ID": { "secretRef": "github-app-installation-id" },
+      "GITHUB_APP_PRIVATE_KEY": { "secretRef": "github-app-private-key" }
+    }
+  },
+  "runtime": {
+    "heartbeatIntervalSec": 1800,
+    "wakeOn": ["issue_assigned", "issue_commented", "mention", "approval"],
+    "budget": {
+      "maxRunsPerDay": 96,
+      "maxRunMinutes": 240
+    }
+  },
+  "skills": ["aidlc-conductor"],
+  "_notes": [
+    "Import through the Paperclip UI (Agents -> New -> Import JSON) or the CLI; field names follow docs/agents-runtime.md and docs/adapters/claude-local.md. Fields under runtime/budget are illustrative; set them in the UI if the importer rejects them.",
+    "model is left empty on purpose: Bedrock model IDs differ from Anthropic's, so the adapter keeps the ANTHROPIC_MODEL env override. Fill the ${BEDROCK_*} values from the paperclip stack output BedrockModelIds.",
+    "The GITHUB_APP_* secret refs are created with `paperclip secrets` or in the UI; the task definition also injects them as plain env for the credential helper, so either path works.",
+    "Execution policy per issue is set by the conductor at runtime from aidlc/stakeholders.yaml; nothing to configure here."
+  ]
+}
