@@ -3,12 +3,13 @@ name: Build conductor image
 on:
   push:
     branches: [main]
-    paths: ["conductor/**", ".github/workflows/build-conductor.yml"]
+    paths:
+      - "conductor/**"
+      - "paperclip/agents/**"
+      - "paperclip/bin/provision-agents"
+      - ".github/workflows/build-conductor.yml"
   workflow_dispatch:
     inputs:
-      aidlc_version:
-        description: AI-DLC release to bake in (must equal aidlc-workspace/.aidlc-version)
-        default: "2.11.0"
       paperclip_tag:
         description: ghcr.io/paperclipai/paperclip tag
         default: "latest"
@@ -45,9 +46,7 @@ jobs:
 
       - id: meta
         run: |
-          AIDLC_VERSION="${{ inputs.aidlc_version || '2.11.0' }}"
-          TAG="${AIDLC_VERSION}-${GITHUB_SHA::7}"
-          echo "aidlc_version=$AIDLC_VERSION" >> "$GITHUB_OUTPUT"
+          TAG="sha-${GITHUB_SHA::7}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "image=${{ steps.ecr.outputs.registry }}/${ECR_REPOSITORY}:${TAG}" >> "$GITHUB_OUTPUT"
 
@@ -55,12 +54,12 @@ jobs:
 
       - uses: docker/build-push-action@v6
         with:
-          context: conductor
+          context: .
+          file: conductor/Dockerfile
           platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.image }}
           build-args: |
-            AIDLC_VERSION=${{ steps.meta.outputs.aidlc_version }}
             PAPERCLIP_TAG=${{ inputs.paperclip_tag || 'latest' }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

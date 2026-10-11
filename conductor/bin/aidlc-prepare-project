@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# Prepare the AI-DLC project checked out in the current directory (or the
+# path given as $1). Paperclip attaches each project as its own workspace;
+# this script does not clone anything and does not know about other projects.
+#
+# The image does not contain an AI-DLC release. The first wake for a pin
+# installs that release into AIDLC_INSTALL_ROOT. Later wakes reuse it.
+#
+# Idempotent. The conductor skill runs it at the start of a wake that is
+# allowed to write this checkout.
+set -euo pipefail
+
+dir="${1:-.}"
+cd "$dir"
+
+log() { printf 'aidlc-prepare-project: %s\n' "$*" >&2; }
+
+if [ ! -f .aidlc-version ]; then
+  log "$PWD has no .aidlc-version; this checkout is not an AI-DLC project"
+  exit 1
+fi
+
+want="$(tr -d '[:space:]' < .aidlc-version)"
+if ! printf '%s\n' "$want" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-preview\.[0-9]{8}\.[1-9][0-9]*)?$'; then
+  log "refusing to install from an invalid .aidlc-version: $want"
+  exit 1
+fi
+
+install_root="${AIDLC_INSTALL_ROOT:-/opt/aidlc}"
+version_bin="$install_root/versions/$want/aidlc"
+if [ ! -x "$version_bin" ]; then
+  log "installing AI-DLC $want"
+  mkdir -p "$install_root"
+  lock="$install_root/.install.lock"
+  (
+    flock -w 300 9
+    if [ ! -x "$version_bin" ]; then
+      tmp="$(mktemp -d)"
+      trap 'rm -rf "$tmp"' EXIT
+      curl -fsSL "https://github.com/awslabs/aidlc-workflows/releases/download/v${want}/install.sh" -o "$tmp/install.sh"
+      sh "$tmp/install.sh" --version "$want" --yes --quiet
+      rm -rf "$tmp"
+      trap - EXIT
+    fi
+  ) 9>"$lock"
+fi
+
+if [ ! -x "$version_bin" ]; then
+  log "AI-DLC $want did not install to $version_bin"
+  exit 1
+fi
+
+# The pin's machine-local target is gitignored, so each fresh checkout must
+# register it. The release now lives under AIDLC_INSTALL_ROOT.
+aidlc config --pin "$want" --project-dir "$PWD" --quiet
+
+# Headless Claude Code only runs project hooks once the folder is trusted and
+# hooks are not disabled. The repo gitignores this file.
+mkdir -p .claude
+if [ ! -f .claude/settings.local.json ]; then
+  cat > .claude/settings.local.json <<'JSON'
+{
+  "disableAllHooks": false
+}
+JSON
+fi
+
+if [ "${AIDLC_VERIFY_BEDROCK:-1}" = "1" ] && command -v aws >/dev/null; then
+  model="${ANTHROPIC_MODEL:-}"
+  if [ -n "$model" ] && aws bedrock get-inference-profile --inference-profile-identifier "$model" >/dev/null 2>&1; then
+    aidlc config providers --mark-done bedrock-model-access --yes >/dev/null 2>&1 || true
+  fi
+fi
+
+aidlc doctor --project-dir "$PWD" --quiet || log "doctor reported problems (see above); continuing"
+log "ready: $PWD (aidlc $want)"

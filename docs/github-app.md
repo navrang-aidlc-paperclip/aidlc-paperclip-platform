@@ -29,8 +29,8 @@ Organization permissions: none.
 
 ## Install and collect ids
 
-1. **Install App** on org `navrang-aidlc-paperclip`, select
-   `aidlc-workspace`, `svc-a`, `svc-b` (add new source repos here later).
+1. **Install App** on org `navrang-aidlc-paperclip`. Grant each project
+   repository as it is added to the board. The image does not name any of them.
 2. Note the **App ID** (app settings page) and the **Installation ID** (the
    number at the end of the URL after installing:
    `.../settings/installations/<id>`).
@@ -38,12 +38,8 @@ Organization permissions: none.
    `cloudformation/secrets/` (gitignored) and reference it from `deploy.env`
    as `GITHUB_APP_PRIVATE_KEY_FILE`.
 
-## Branch protection on the source repos
+## Branch protection
 
-`main` of `svc-a`/`svc-b`: require PR, require CODEOWNERS review, do **not**
-add the app to the bypass list. The conductor opens PRs; humans merge.
-
-`main` of `aidlc-workspace`: the conductor pushes record commits directly
-(`aidlc/**`). Protect everything else with CODEOWNERS (already in the repo).
-If you want record commits reviewed too, set `AIDLC_RECORD_BRANCH` on the
-task and the conductor will push to that branch and open a PR instead.
+On each project repository, protect the default branch: require a pull
+request and CODEOWNERS review, and do **not** add the app to the bypass
+list. The conductor opens PRs; humans merge.

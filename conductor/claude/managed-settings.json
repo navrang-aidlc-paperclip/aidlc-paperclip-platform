@@ -1,0 +1,3 @@
+{
+  "awsCredentialExport": "/usr/local/bin/ecs-task-credentials"
+}

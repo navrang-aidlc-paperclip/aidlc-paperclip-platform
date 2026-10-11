@@ -3,7 +3,7 @@ Description: >-
   aidlc-platform / data: RDS Postgres 17, EFS for /paperclip, S3 for run logs,
   ECR for the conductor image, and every secret the Paperclip task reads
   (DATABASE_URL, BETTER_AUTH_SECRET, tool-action signing secret, GitHub App
-  credentials, Entra client secret).
+  credentials). The pilot does not use an identity provider in front of the board.
 
 Parameters:
   Name:
@@ -28,10 +28,6 @@ Parameters:
     Type: String
     NoEcho: true
     Description: GitHub App private key PEM. Pass with --parameter-overrides from a file, never commit.
-  EntraClientSecret:
-    Type: String
-    NoEcho: true
-    Description: Entra ID app registration client secret used by the ALB OIDC action.
 
 Resources:
   # ------------------------------------------------------------------ RDS
@@ -90,7 +86,7 @@ Resources:
     Properties:
       Name: !Sub "${Name}/paperclip/database-url"
       SecretString: !Sub
-        - "postgres://paperclip:${Password}@${Host}:5432/paperclip"
+        - "postgres://paperclip:${Password}@${Host}:5432/paperclip?sslmode=require"
         - Password: !Sub "{{resolve:secretsmanager:${DbMasterSecret}:SecretString:password}}"
           Host: !GetAtt Db.Endpoint.Address
 
@@ -129,15 +125,10 @@ Resources:
       Name: !Sub "${Name}/github-app/private-key"
       SecretString: !Ref GitHubAppPrivateKeyPem
 
-  EntraClientSecretSecret:
-    Type: AWS::SecretsManager::Secret
-    Properties:
-      Name: !Sub "${Name}/entra/client-secret"
-      SecretString: !Ref EntraClientSecret
-
   # ------------------------------------------------------------------ EFS (/paperclip)
-  # Holds Paperclip's instance config, the Claude session store, and the
-  # aidlc-workspace checkout + sibling repos under /paperclip/workspaces.
+  # Holds Paperclip's instance config and Claude session store. Project
+  # checkouts are not created here; put a project's workspace cwd on this
+  # volume (/paperclip) when you add the project, so it survives a new task.
   FileSystem:
     Type: AWS::EFS::FileSystem
     DeletionPolicy: Retain
@@ -224,9 +215,6 @@ Outputs:
   GitHubAppPrivateKeySecretArn:
     Value: !Ref GitHubAppPrivateKeySecret
     Export: { Name: !Sub "${Name}-GitHubAppPrivateKeySecretArn" }
-  EntraClientSecretArn:
-    Value: !Ref EntraClientSecretSecret
-    Export: { Name: !Sub "${Name}-EntraClientSecretArn" }
   FileSystemId:
     Value: !Ref FileSystem
     Export: { Name: !Sub "${Name}-FileSystemId" }

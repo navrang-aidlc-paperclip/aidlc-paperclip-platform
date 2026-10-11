@@ -1,0 +1,4 @@
+.git
+cloudformation/secrets
+**/*.pem
+**/*.key

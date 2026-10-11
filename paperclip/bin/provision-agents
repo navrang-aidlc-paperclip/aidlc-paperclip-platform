@@ -1,0 +1,300 @@
+#!/usr/bin/env python3
+"""Install the AI-DLC conductor and specialist employees on a Paperclip board.
+
+Reads paperclip/agents/*.json and conductor/skills/*/SKILL.md (or the copies
+baked into the image at /opt/conductor). Creates company skills, then employees.
+Re-running updates titles, adapter config, and skill text. It does not create
+a company, a project, or an issue.
+
+  paperclip/bin/provision-agents \
+    --url https://board.example \
+    --api-key "$PAPERCLIP_API_KEY"
+
+Bedrock model ids replace the ${BEDROCK_*} placeholders. Pass them as flags
+or as BEDROCK_PRIMARY_MODEL, BEDROCK_OPUS_MODEL, BEDROCK_SONNET_MODEL, and
+BEDROCK_HAIKU_MODEL. The paperclip stack output BedrockModelIds is the source.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import ssl
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+
+PLACEHOLDERS = {
+    "BEDROCK_PRIMARY_MODEL": "${BEDROCK_PRIMARY_MODEL}",
+    "BEDROCK_OPUS_MODEL": "${BEDROCK_OPUS_MODEL}",
+    "BEDROCK_SONNET_MODEL": "${BEDROCK_SONNET_MODEL}",
+    "BEDROCK_HAIKU_MODEL": "${BEDROCK_HAIKU_MODEL}",
+}
+
+
+def ssl_context() -> ssl.SSLContext:
+    candidates = [os.environ.get("SSL_CERT_FILE", "")]
+    try:
+        import certifi
+
+        candidates.append(certifi.where())
+    except ImportError:
+        pass
+    candidates.extend(
+        [
+            "/etc/ssl/cert.pem",
+            "/opt/homebrew/etc/ca-certificates/cert.pem",
+            "/opt/homebrew/etc/openssl@3/cert.pem",
+        ]
+    )
+    for path in candidates:
+        if path and os.path.isfile(path):
+            return ssl.create_default_context(cafile=path)
+    return ssl.create_default_context()
+
+
+def request(url: str, method: str, body: dict | None = None, headers: dict | None = None):
+    data = None if body is None else json.dumps(body).encode()
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("accept", "application/json")
+    if body is not None:
+        req.add_header("content-type", "application/json")
+    for key, value in (headers or {}).items():
+        req.add_header(key, value)
+    try:
+        with urllib.request.urlopen(req, timeout=60, context=ssl_context()) as resp:
+            raw = resp.read().decode()
+            parsed = json.loads(raw) if raw else {}
+            return resp.status, parsed
+    except urllib.error.HTTPError as err:
+        raw = err.read().decode()
+        try:
+            parsed = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            parsed = {"error": raw}
+        return err.code, parsed
+
+
+def rows(body, key: str) -> list:
+    if isinstance(body, list):
+        return body
+    if isinstance(body, dict):
+        value = body.get(key) or body.get("items") or body.get("data")
+        if isinstance(value, list):
+            return value
+    raise SystemExit(f"unexpected {key} response: {body}")
+
+
+def locate() -> tuple[Path, Path]:
+    here = Path(__file__).resolve().parent
+    repo_agents = here.parent / "agents"
+    repo_skills = here.parent.parent / "conductor" / "skills"
+    if repo_agents.is_dir() and (repo_skills / "aidlc-conductor" / "SKILL.md").is_file():
+        return repo_agents, repo_skills
+    for image_agents, image_skills in (
+        (Path("/opt/conductor/paperclip-agents"), Path("/opt/conductor/paperclip-skills")),
+        (Path("/opt/aidlc/paperclip-agents"), Path("/opt/aidlc/paperclip-skills")),
+    ):
+        if image_agents.is_dir() and (image_skills / "aidlc-conductor" / "SKILL.md").is_file():
+            return image_agents, image_skills
+    raise SystemExit("cannot find paperclip/agents and conductor/skills")
+
+
+def models_from(args) -> dict[str, str]:
+    found = {
+        "BEDROCK_PRIMARY_MODEL": args.bedrock_primary or os.environ.get("BEDROCK_PRIMARY_MODEL", ""),
+        "BEDROCK_OPUS_MODEL": args.bedrock_opus or os.environ.get("BEDROCK_OPUS_MODEL", ""),
+        "BEDROCK_SONNET_MODEL": args.bedrock_sonnet or os.environ.get("BEDROCK_SONNET_MODEL", ""),
+        "BEDROCK_HAIKU_MODEL": args.bedrock_haiku or os.environ.get("BEDROCK_HAIKU_MODEL", ""),
+    }
+    missing = [name for name, value in found.items() if not value]
+    if missing:
+        raise SystemExit("missing " + ", ".join(missing))
+    return found
+
+
+def substitute(value, models: dict[str, str]):
+    if isinstance(value, str):
+        out = value
+        for name, token in PLACEHOLDERS.items():
+            out = out.replace(token, models[name])
+        if "${" in out:
+            raise SystemExit(f"unresolved placeholder in {value}")
+        return out
+    if isinstance(value, dict) and set(value) == {"secretRef"}:
+        return {"type": "user_secret_ref", "key": value["secretRef"]}
+    if isinstance(value, dict):
+        return {key: substitute(item, models) for key, item in value.items()}
+    if isinstance(value, list):
+        return [substitute(item, models) for item in value]
+    return value
+
+
+def runtime_config(runtime: dict) -> dict:
+    interval = runtime.get("heartbeatIntervalSec")
+    enabled = isinstance(interval, int) and interval > 0
+    heartbeat = {
+        "enabled": enabled,
+        "wakeOnDemand": True,
+        "skipTimerWhenNoActionableWork": True,
+        "cooldownSec": 10,
+        "maxConcurrentRuns": int(runtime.get("maxConcurrentRuns", 1)),
+    }
+    if enabled:
+        heartbeat["intervalSec"] = interval
+    return {"heartbeat": heartbeat}
+
+
+def payload(doc: dict, models: dict[str, str], reports_to: str | None) -> dict:
+    body = {
+        "name": doc["name"],
+        "title": doc["title"],
+        "role": doc["role"],
+        "icon": doc.get("icon"),
+        "capabilities": doc.get("capabilities"),
+        "adapterType": doc["adapterType"],
+        "adapterConfig": substitute(doc["adapterConfig"], models),
+        "runtimeConfig": runtime_config(doc.get("runtime") or {}),
+        "desiredSkills": doc.get("skills") or [],
+    }
+    if reports_to:
+        body["reportsTo"] = reports_to
+    return body
+
+
+def company_id(base: str, api_key: str, requested: str | None) -> str:
+    status, body = request(
+        base + "/api/companies",
+        "GET",
+        headers={"authorization": f"Bearer {api_key}"},
+    )
+    if status != 200:
+        raise SystemExit(f"could not list companies ({status}): {body}")
+    found = rows(body, "companies")
+    if requested:
+        match = [row for row in found if row.get("id") == requested or row.get("name") == requested]
+        if not match:
+            raise SystemExit(f"company {requested} is not visible to this key")
+        return match[0]["id"]
+    if len(found) == 1:
+        return found[0]["id"]
+    print("pass --company; this key can see:", file=sys.stderr)
+    for row in found:
+        print(f"  {row.get('id')}  {row.get('name')}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def install_skills(base: str, api_key: str, company: str, skills_dir: Path) -> None:
+    headers = {"authorization": f"Bearer {api_key}"}
+    status, body = request(f"{base}/api/companies/{company}/skills", "GET", headers=headers)
+    if status != 200:
+        raise SystemExit(f"could not list skills ({status}): {body}")
+    by_slug = {row.get("slug"): row for row in rows(body, "skills")}
+    for skill_dir in sorted(path for path in skills_dir.iterdir() if (path / "SKILL.md").is_file()):
+        markdown = (skill_dir / "SKILL.md").read_text()
+        slug = skill_dir.name
+        existing = by_slug.get(slug)
+        if existing is None:
+            status, created = request(
+                f"{base}/api/companies/{company}/skills",
+                "POST",
+                {"name": slug, "slug": slug, "markdown": markdown},
+                headers,
+            )
+            if status not in (200, 201):
+                raise SystemExit(f"could not create skill {slug} ({status}): {created}")
+            print(f"skill {slug}: created")
+            continue
+        status, updated = request(
+            f"{base}/api/companies/{company}/skills/{existing['id']}/files",
+            "PATCH",
+            {"path": "SKILL.md", "content": markdown},
+            headers,
+        )
+        if status not in (200, 201):
+            raise SystemExit(f"could not update skill {slug} ({status}): {updated}")
+        print(f"skill {slug}: updated")
+
+
+def upsert_agent(base: str, api_key: str, company: str, body: dict, existing: dict | None) -> dict:
+    headers = {"authorization": f"Bearer {api_key}"}
+    if existing is None:
+        status, created = request(
+            f"{base}/api/companies/{company}/agents",
+            "POST",
+            body,
+            headers,
+        )
+        if status not in (200, 201):
+            raise SystemExit(f"could not create {body['name']} ({status}): {created}")
+        print(f"agent {body['name']}: created ({body['title']})")
+        return created
+    status, updated = request(
+        f"{base}/api/agents/{existing['id']}",
+        "PATCH",
+        {**body, "replaceAdapterConfig": True},
+        headers,
+    )
+    if status not in (200, 201):
+        raise SystemExit(f"could not update {body['name']} ({status}): {updated}")
+    print(f"agent {body['name']}: updated ({body['title']})")
+    return updated
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--url", required=True, help="Paperclip board origin, no trailing path")
+    parser.add_argument("--api-key", required=True, help="board API key for an Owner or Admin")
+    parser.add_argument("--company", help="company id or name; required when the board has more than one")
+    parser.add_argument("--bedrock-primary", help="inference profile id for ANTHROPIC_MODEL")
+    parser.add_argument("--bedrock-opus")
+    parser.add_argument("--bedrock-sonnet")
+    parser.add_argument("--bedrock-haiku")
+    args = parser.parse_args()
+    base = args.url.rstrip("/")
+    models = models_from(args)
+    agents_dir, skills_dir = locate()
+    docs = []
+    for path in sorted(agents_dir.glob("*.json")):
+        docs.append(json.loads(path.read_text()))
+    names = {doc["name"] for doc in docs}
+    if "aidlc-conductor" not in names:
+        raise SystemExit("aidlc-conductor.json is missing")
+    company = company_id(base, args.api_key, args.company)
+    install_skills(base, args.api_key, company, skills_dir)
+    status, body = request(
+        f"{base}/api/companies/{company}/agents",
+        "GET",
+        headers={"authorization": f"Bearer {args.api_key}"},
+    )
+    if status != 200:
+        raise SystemExit(f"could not list agents ({status}): {body}")
+    by_name = {row.get("name"): row for row in rows(body, "agents")}
+    conductor_doc = next(doc for doc in docs if doc["name"] == "aidlc-conductor")
+    conductor = upsert_agent(
+        base,
+        args.api_key,
+        company,
+        payload(conductor_doc, models, None),
+        by_name.get("aidlc-conductor"),
+    )
+    conductor_id = conductor.get("id") or (by_name.get("aidlc-conductor") or {}).get("id")
+    if not conductor_id:
+        raise SystemExit(f"conductor response had no id: {conductor}")
+    for doc in docs:
+        if doc["name"] == "aidlc-conductor":
+            continue
+        upsert_agent(
+            base,
+            args.api_key,
+            company,
+            payload(doc, models, conductor_id),
+            by_name.get(doc["name"]),
+        )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

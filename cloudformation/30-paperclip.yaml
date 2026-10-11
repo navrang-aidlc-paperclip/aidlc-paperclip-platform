@@ -1,9 +1,10 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >-
   aidlc-platform / paperclip: ECS Fargate service running the Paperclip +
-  AI-DLC conductor image behind an ALB that authenticates every request with
-  Microsoft Entra ID (OIDC). Task role grants Bedrock, EFS, S3 run logs and
-  ECS Exec. Also creates the GitHub Actions OIDC role that pushes images.
+  AI-DLC conductor image behind an ALB. The pilot uses Paperclip's own
+  accounts; there is no identity provider in front of the board. Task role
+  grants Bedrock, EFS, S3 run logs and ECS Exec. Also creates the GitHub
+  Actions OIDC role that pushes images.
 
 Parameters:
   Name:
@@ -11,7 +12,7 @@ Parameters:
     Default: aidlc
   Image:
     Type: String
-    Description: Full ECR image URI incl. tag, e.g. 123.dkr.ecr.eu-central-1.amazonaws.com/aidlc-conductor:2.11.0-abc123
+    Description: Full ECR image URI incl. tag, e.g. 123.dkr.ecr.eu-central-1.amazonaws.com/aidlc-conductor:r5
   Cpu:
     Type: Number
     Default: 2048
@@ -24,16 +25,12 @@ Parameters:
     Description: 1 for the pilot. Set 0 to scale to zero overnight.
   Domain:
     Type: String
-    Description: FQDN of the board, e.g. aidlc.corp.example.com
+    Default: ""
+    Description: FQDN of the board. Empty serves HTTP on the ALB DNS name, which is the pilot when no DNS zone exists.
   HostedZoneId:
     Type: String
     Default: ""
     Description: Route53 zone id for Domain. Empty = DNS and ACM validation records are created by hand.
-  EntraTenantId:
-    Type: String
-  EntraClientId:
-    Type: String
-    Description: App registration client id. Redirect URI must be https://<Domain>/oauth2/idpresponse
   DisableSignUp:
     Type: String
     Default: "false"
@@ -41,27 +38,28 @@ Parameters:
     Description: Set true after the first Owner signed up.
   BedrockPrimaryModel:
     Type: String
-    Default: eu.anthropic.claude-opus-4-8-v1:0
-    Description: Verify with `aws bedrock list-inference-profiles --region eu-central-1`
+    Default: eu.anthropic.claude-sonnet-4-6
+    Description: Ids confirmed with list-inference-profiles in this account, eu-central-1. Opus 4.8 is not granted to this account.
   BedrockOpusModel:
     Type: String
-    Default: eu.anthropic.claude-opus-4-8-v1:0
+    Default: eu.anthropic.claude-sonnet-4-6
   BedrockSonnetModel:
     Type: String
-    Default: eu.anthropic.claude-sonnet-4-6-v1:0
+    Default: eu.anthropic.claude-sonnet-4-6
   BedrockHaikuModel:
     Type: String
-    Default: eu.anthropic.claude-haiku-4-6-v1:0
-  WorkspaceRepoUrl:
-    Type: String
-    Default: https://github.com/navrang-aidlc-paperclip/aidlc-workspace.git
+    Default: eu.anthropic.claude-haiku-4-5-20251001-v1:0
   GitHubActionsRepo:
     Type: String
     Default: navrang-aidlc-paperclip/aidlc-platform
     Description: <org>/<repo> allowed to assume the image-push role via GitHub OIDC.
 
 Conditions:
-  HasHostedZone: !Not [!Equals [!Ref HostedZoneId, ""]]
+  HasDomain: !Not [!Equals [!Ref Domain, ""]]
+  NoDomain: !Equals [!Ref Domain, ""]
+  HasHostedZone: !And
+    - !Condition HasDomain
+    - !Not [!Equals [!Ref HostedZoneId, ""]]
 
 Resources:
   # ------------------------------------------------------------------ logs
@@ -222,7 +220,14 @@ Resources:
             - { Name: PAPERCLIP_CONFIG, Value: /paperclip/instances/default/config.json }
             - { Name: PAPERCLIP_DEPLOYMENT_MODE, Value: authenticated }
             - { Name: PAPERCLIP_DEPLOYMENT_EXPOSURE, Value: public }
-            - { Name: PAPERCLIP_PUBLIC_URL, Value: !Sub "https://${Domain}" }
+            - Name: PAPERCLIP_PUBLIC_URL
+              Value: !If
+                - HasDomain
+                - !Sub "https://${Domain}"
+                - !Sub "https://${Distribution.DomainName}"
+            # CloudFront plus the ALB are two hops. A custom domain has only the ALB.
+            - Name: TRUST_PROXY
+              Value: !If [HasDomain, "1", "2"]
             - { Name: PAPERCLIP_MIGRATION_AUTO_APPLY, Value: "true" }
             - { Name: HEARTBEAT_SCHEDULER_ENABLED, Value: "true" }
             - { Name: PAPERCLIP_AUTH_DISABLE_SIGN_UP, Value: !Ref DisableSignUp }
@@ -238,11 +243,6 @@ Resources:
             - { Name: ANTHROPIC_DEFAULT_SONNET_MODEL, Value: !Ref BedrockSonnetModel }
             - { Name: ANTHROPIC_DEFAULT_HAIKU_MODEL, Value: !Ref BedrockHaikuModel }
             - { Name: DISABLE_PROMPT_CACHING, Value: "0" }
-            # Conductor workspace bootstrap
-            - { Name: AIDLC_WORKSPACES_ROOT, Value: /paperclip/workspaces }
-            - { Name: AIDLC_WORKSPACE_REPO, Value: !Ref WorkspaceRepoUrl }
-            - { Name: AIDLC_WORKSPACE_NAME, Value: aidlc-workspace }
-            - { Name: AIDLC_WORKSPACE_BRANCH, Value: main }
           Secrets:
             - { Name: DATABASE_URL, ValueFrom: !ImportValue { "Fn::Sub": "${Name}-DatabaseUrlSecretArn" } }
             - { Name: BETTER_AUTH_SECRET, ValueFrom: !ImportValue { "Fn::Sub": "${Name}-BetterAuthSecretArn" } }
@@ -269,7 +269,7 @@ Resources:
 
   Service:
     Type: AWS::ECS::Service
-    DependsOn: HttpsListener
+    DependsOn: HttpListener
     Properties:
       ServiceName: !Sub "${Name}-paperclip"
       Cluster: !Ref Cluster
@@ -293,9 +293,10 @@ Resources:
           ContainerPort: 3100
           TargetGroupArn: !Ref TargetGroup
 
-  # ------------------------------------------------------------------ ALB + TLS + OIDC
+  # ------------------------------------------------------------------ ALB + TLS
   Certificate:
     Type: AWS::CertificateManager::Certificate
+    Condition: HasDomain
     Properties:
       DomainName: !Ref Domain
       ValidationMethod: DNS
@@ -336,6 +337,7 @@ Resources:
 
   HttpsListener:
     Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: HasDomain
     Properties:
       LoadBalancerArn: !Ref LoadBalancer
       Port: 443
@@ -343,44 +345,8 @@ Resources:
       SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
       Certificates: [{ CertificateArn: !Ref Certificate }]
       DefaultActions:
-        # Every request to the board is authenticated with Entra ID first.
-        # Paperclip still has its own accounts; the first sign-up uses the same
-        # corporate e-mail. Set DisableSignUp=true afterwards.
-        - Type: authenticate-oidc
-          Order: 1
-          AuthenticateOidcConfig:
-            Issuer: !Sub "https://login.microsoftonline.com/${EntraTenantId}/v2.0"
-            AuthorizationEndpoint: !Sub "https://login.microsoftonline.com/${EntraTenantId}/oauth2/v2.0/authorize"
-            TokenEndpoint: !Sub "https://login.microsoftonline.com/${EntraTenantId}/oauth2/v2.0/token"
-            UserInfoEndpoint: https://graph.microsoft.com/oidc/userinfo
-            ClientId: !Ref EntraClientId
-            ClientSecret: !Sub
-              - "{{resolve:secretsmanager:${Arn}:SecretString}}"
-              - Arn: !ImportValue { "Fn::Sub": "${Name}-EntraClientSecretArn" }
-            Scope: openid profile email
-            SessionCookieName: AWSELBAuthSessionCookie
-            SessionTimeout: 43200
-            OnUnauthenticatedRequest: authenticate
-        - Type: forward
-          Order: 2
-          TargetGroupArn: !Ref TargetGroup
-
-  # Agent API calls that carry a Paperclip agent key (webhooks, Hermes later,
-  # the conductor itself if it ever runs outside the task) must not be bounced
-  # to the Entra login page. They are authenticated by Paperclip itself.
-  ApiBypassRule:
-    Type: AWS::ElasticLoadBalancingV2::ListenerRule
-    Properties:
-      ListenerArn: !Ref HttpsListener
-      Priority: 10
-      Conditions:
-        - Field: path-pattern
-          Values: ["/api/*"]
-        - Field: http-header
-          HttpHeaderConfig:
-            HttpHeaderName: Authorization
-            Values: ["Bearer *"]
-      Actions:
+        # Paperclip authenticates its own users. Set DisableSignUp=true after
+        # the first Owner account exists.
         - Type: forward
           TargetGroupArn: !Ref TargetGroup
 
@@ -390,9 +356,45 @@ Resources:
       LoadBalancerArn: !Ref LoadBalancer
       Port: 80
       Protocol: HTTP
-      DefaultActions:
-        - Type: redirect
-          RedirectConfig: { Protocol: HTTPS, Port: "443", StatusCode: HTTP_301 }
+      DefaultActions: !If
+        - HasDomain
+        - - Type: redirect
+            RedirectConfig: { Protocol: HTTPS, Port: "443", StatusCode: HTTP_301 }
+        - - Type: forward
+            TargetGroupArn: !Ref TargetGroup
+
+  # No customer domain: CloudFront's default certificate is the HTTPS front.
+  # The ALB stays HTTP because CloudFront fetches it as the origin. A redirect
+  # on port 80 would loop, so the address to use is the distribution hostname.
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Condition: NoDomain
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub "${Name}-paperclip"
+        HttpVersion: http2and3
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: alb
+            DomainName: !GetAtt LoadBalancer.DNSName
+            CustomOriginConfig:
+              OriginProtocolPolicy: http-only
+              HTTPPort: 80
+              OriginReadTimeout: 60
+              OriginKeepaliveTimeout: 60
+        DefaultCacheBehavior:
+          TargetOriginId: alb
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+          CachedMethods: [GET, HEAD, OPTIONS]
+          Compress: true
+          # CachingDisabled and AllViewer. The app is dynamic; Host must stay
+          # the distribution name so it matches PAPERCLIP_PUBLIC_URL.
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
 
   DnsRecord:
     Type: AWS::Route53::RecordSet
@@ -463,7 +465,10 @@ Resources:
 
 Outputs:
   BoardUrl:
-    Value: !Sub "https://${Domain}"
+    Value: !If
+      - HasDomain
+      - !Sub "https://${Domain}"
+      - !Sub "https://${Distribution.DomainName}"
   LoadBalancerDnsName:
     Description: Create a CNAME from Domain to this if HostedZoneId was empty.
     Value: !GetAtt LoadBalancer.DNSName
@@ -477,7 +482,7 @@ Outputs:
     Description: Put in the aidlc-platform GitHub repo as variable AWS_IMAGE_PUSH_ROLE_ARN.
     Value: !GetAtt ImagePushRole.Arn
   BedrockModelIds:
-    Description: Values for the ${BEDROCK_*} placeholders in paperclip/agents/aidlc-conductor.json
+    Description: Values for the ${BEDROCK_*} placeholders in paperclip/agents/*.json
     Value: !Sub "primary=${BedrockPrimaryModel} opus=${BedrockOpusModel} sonnet=${BedrockSonnetModel} haiku=${BedrockHaikuModel}"
   ExecIntoTask:
     Value: !Sub "aws ecs execute-command --cluster ${Cluster} --task <task-id> --container paperclip --interactive --command bash --region ${AWS::Region}"

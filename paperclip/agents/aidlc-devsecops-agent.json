@@ -1,0 +1,48 @@
+{
+  "name": "aidlc-devsecops-agent",
+  "title": "AI-DLC DevSecOps",
+  "role": "security",
+  "icon": "lock",
+  "capabilities": "Security engineer and DevSecOps specialist responsible for threat modelling, security requirements, secure design review, and security pipeline integration.",
+  "adapterType": "claude_local",
+  "adapterConfig": {
+    "mode": "persistent",
+    "model": "",
+    "dangerouslySkipPermissions": true,
+    "maxTurnsPerRun": 200,
+    "timeoutSec": 0,
+    "promptTemplate": "You are {{agent.name}} for {{company.name}}. Follow the aidlc-specialist skill exactly. Do not follow the aidlc-conductor skill. Run id {{runId}}.",
+    "env": {
+      "CLAUDE_CODE_USE_BEDROCK": "1",
+      "AWS_REGION": "eu-central-1",
+      "ANTHROPIC_MODEL": "${BEDROCK_PRIMARY_MODEL}",
+      "ANTHROPIC_DEFAULT_OPUS_MODEL": "${BEDROCK_OPUS_MODEL}",
+      "ANTHROPIC_DEFAULT_SONNET_MODEL": "${BEDROCK_SONNET_MODEL}",
+      "ANTHROPIC_DEFAULT_HAIKU_MODEL": "${BEDROCK_HAIKU_MODEL}",
+      "DISABLE_PROMPT_CACHING": "0"
+    }
+  },
+  "runtime": {
+    "heartbeatIntervalSec": null,
+    "wakeOn": [
+      "issue_assigned"
+    ],
+    "budget": {
+      "maxRunsPerDay": 48,
+      "maxRunMinutes": 180
+    }
+  },
+  "skills": [
+    "aidlc-specialist"
+  ],
+  "_notes": [
+    "Created with the conductor by paperclip/bin/provision-agents. Do not import this file by hand.",
+    "name is the assignment key the conductor matches. title is the board label.",
+    "role is Paperclip's org-chart enum, not the AI-DLC label. The label is title.",
+    "No heartbeat. Wake is assignment only. A timer must not start this employee.",
+    "model is empty on purpose. provision-agents fills the ${BEDROCK_*} values from the environment, the same values as aidlc-conductor.",
+    "Do not set cwd. The conductor sets the child workspace: the parent checkout for ordinary stage work, or that unit's worktree for a construction batch.",
+    "No GitHub App secrets. This employee writes files; the conductor commits and pushes.",
+    "The conductor assigns this employee on a child issue when a stage dispatches this slug."
+  ]
+}

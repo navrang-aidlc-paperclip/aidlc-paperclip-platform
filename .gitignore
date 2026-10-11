@@ -6,3 +6,5 @@ cloudformation/secrets/
 # local scratch
 .DS_Store
 td.json
+__pycache__/
+*.pyc

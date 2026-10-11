@@ -1,15 +1,17 @@
 {
   "name": "aidlc-conductor",
-  "role": "AI-DLC conductor",
+  "title": "AI-DLC conductor",
+  "role": "general",
+  "icon": "sparkles",
+  "capabilities": "Runs the AI-DLC workflow for a project and assigns specialist employees when a stage dispatches them.",
   "adapterType": "claude_local",
   "adapterConfig": {
-    "cwd": "/paperclip/workspaces/aidlc-workspace",
     "mode": "persistent",
     "model": "",
     "dangerouslySkipPermissions": true,
     "maxTurnsPerRun": 300,
     "timeoutSec": 0,
-    "promptTemplate": "You are {{agent.name}} for {{company.name}}. Follow the aidlc-conductor skill exactly. Run id {{runId}}.",
+    "promptTemplate": "You are {{agent.name}} for {{company.name}}. Follow the aidlc-conductor skill exactly. When a stage dispatches a specialist, assign that Paperclip employee. Do not do that specialist's work in this session, except inline stages and aidlc-composer-agent. Run id {{runId}}.",
     "env": {
       "CLAUDE_CODE_USE_BEDROCK": "1",
       "AWS_REGION": "eu-central-1",
@@ -18,24 +20,42 @@
       "ANTHROPIC_DEFAULT_SONNET_MODEL": "${BEDROCK_SONNET_MODEL}",
       "ANTHROPIC_DEFAULT_HAIKU_MODEL": "${BEDROCK_HAIKU_MODEL}",
       "DISABLE_PROMPT_CACHING": "0",
-      "GITHUB_APP_ID": { "secretRef": "github-app-id" },
-      "GITHUB_APP_INSTALLATION_ID": { "secretRef": "github-app-installation-id" },
-      "GITHUB_APP_PRIVATE_KEY": { "secretRef": "github-app-private-key" }
+      "GITHUB_APP_ID": {
+        "secretRef": "github-app-id"
+      },
+      "GITHUB_APP_INSTALLATION_ID": {
+        "secretRef": "github-app-installation-id"
+      },
+      "GITHUB_APP_PRIVATE_KEY": {
+        "secretRef": "github-app-private-key"
+      }
     }
   },
   "runtime": {
+    "maxConcurrentRuns": 1,
     "heartbeatIntervalSec": 1800,
-    "wakeOn": ["issue_assigned", "issue_commented", "mention", "approval"],
+    "wakeOn": [
+      "issue_assigned",
+      "issue_commented",
+      "mention",
+      "approval",
+      "issue_children_completed"
+    ],
     "budget": {
       "maxRunsPerDay": 96,
       "maxRunMinutes": 240
     }
   },
-  "skills": ["aidlc-conductor"],
+  "skills": [
+    "aidlc-conductor"
+  ],
   "_notes": [
-    "Import through the Paperclip UI (Agents -> New -> Import JSON) or the CLI; field names follow docs/agents-runtime.md and docs/adapters/claude-local.md. Fields under runtime/budget are illustrative; set them in the UI if the importer rejects them.",
-    "model is left empty on purpose: Bedrock model IDs differ from Anthropic's, so the adapter keeps the ANTHROPIC_MODEL env override. Fill the ${BEDROCK_*} values from the paperclip stack output BedrockModelIds.",
+    "Created with the specialists by paperclip/bin/provision-agents. Do not import this file by hand.",
+    "name is the assignment key. title is the board label AI-DLC conductor.",
+    "role is Paperclip's org-chart enum (general). The AI-DLC label is title.",
+    "model is left empty on purpose: Bedrock model IDs differ from Anthropic's, so the adapter keeps the ANTHROPIC_MODEL env override. provision-agents fills the ${BEDROCK_*} values from the environment.",
     "The GITHUB_APP_* secret refs are created with `paperclip secrets` or in the UI; the task definition also injects them as plain env for the credential helper, so either path works.",
-    "Execution policy per issue is set by the conductor at runtime from aidlc/stakeholders.yaml; nothing to configure here."
+    "Do not set cwd here. Each Paperclip project has its own workspace, and that workspace is the working directory for issues in that project.",
+    "Execution policy per issue is set by the conductor at runtime from that project's aidlc/stakeholders.yaml; nothing to configure here."
   ]
 }

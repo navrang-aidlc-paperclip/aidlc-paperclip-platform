@@ -1,0 +1,234 @@
+#!/usr/bin/env python3
+"""Create Paperclip users for the emails in an AI-DLC stakeholders file.
+
+The file is not part of this platform. Pass it in:
+
+  paperclip/bin/provision-stakeholders \
+    --stakeholders /path/to/aidlc/stakeholders.yaml \
+    --url https://board.example \
+    --api-key "$PAPERCLIP_API_KEY"
+
+Sign-up uses Paperclip's own email/password accounts. With a board API key
+the new account is also invited as a Viewer and that join is approved.
+Without the key, the account exists and still has to join the company.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import secrets
+import ssl
+import string
+import sys
+import urllib.error
+import urllib.request
+
+
+def emails_from_stakeholders(text: str) -> list[str]:
+    """Emails listed under roles:, in file order, without duplicates."""
+    found: list[str] = []
+    seen: set[str] = set()
+    in_roles = False
+    for raw in text.splitlines():
+        if raw.startswith("roles:"):
+            in_roles = True
+            continue
+        if in_roles and raw and not raw.startswith((" ", "\t", "#")):
+            break
+        if not in_roles:
+            continue
+        stripped = raw.strip()
+        if not stripped.startswith("- "):
+            continue
+        email = stripped[2:].strip().strip("'\"").lower()
+        if "@" not in email or email in seen:
+            continue
+        seen.add(email)
+        found.append(email)
+    return found
+
+
+def password() -> str:
+    alphabet = string.ascii_letters + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(24))
+
+
+def ssl_context() -> ssl.SSLContext:
+    candidates = [os.environ.get("SSL_CERT_FILE", "")]
+    try:
+        import certifi
+
+        candidates.append(certifi.where())
+    except ImportError:
+        pass
+    candidates.extend(
+        [
+            "/etc/ssl/cert.pem",
+            "/opt/homebrew/etc/ca-certificates/cert.pem",
+            "/opt/homebrew/etc/openssl@3/cert.pem",
+        ]
+    )
+    for path in candidates:
+        if path and os.path.isfile(path):
+            return ssl.create_default_context(cafile=path)
+    return ssl.create_default_context()
+
+
+def request(url: str, method: str, body: dict | None = None, headers: dict | None = None):
+    data = None if body is None else json.dumps(body).encode()
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("accept", "application/json")
+    if body is not None:
+        req.add_header("content-type", "application/json")
+    for key, value in (headers or {}).items():
+        req.add_header(key, value)
+    try:
+        with urllib.request.urlopen(req, timeout=30, context=ssl_context()) as resp:
+            raw = resp.read().decode()
+            parsed = json.loads(raw) if raw else {}
+            return resp.status, parsed, resp.headers
+    except urllib.error.HTTPError as err:
+        raw = err.read().decode()
+        try:
+            parsed = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            parsed = {"error": raw}
+        return err.code, parsed, err.headers
+
+
+def origin_headers(base: str) -> dict[str, str]:
+    return {"origin": base, "referer": base + "/"}
+
+
+def signup(base: str, email: str, name: str, secret: str):
+    return request(
+        base + "/api/auth/sign-up/email",
+        "POST",
+        {"email": email, "password": secret, "name": name},
+        origin_headers(base),
+    )
+
+
+def signin(base: str, email: str, secret: str):
+    return request(
+        base + "/api/auth/sign-in/email",
+        "POST",
+        {"email": email, "password": secret},
+        origin_headers(base),
+    )
+
+
+def cookie_header(headers) -> str | None:
+    raw = headers.get_all("Set-Cookie") if hasattr(headers, "get_all") else None
+    if not raw:
+        return None
+    pairs = []
+    for item in raw:
+        pairs.append(item.split(";", 1)[0])
+    return "; ".join(pairs)
+
+
+def companies(base: str, api_key: str):
+    status, body, _ = request(
+        base + "/api/companies",
+        "GET",
+        headers={"authorization": f"Bearer {api_key}"},
+    )
+    if status != 200 or not isinstance(body, list):
+        raise SystemExit(f"could not list companies ({status}): {body}")
+    return body
+
+
+def join_as_viewer(base: str, api_key: str, company_id: str, email: str, secret: str) -> None:
+    status, invite, _ = request(
+        f"{base}/api/companies/{company_id}/invites",
+        "POST",
+        {"allowedJoinTypes": "human", "humanRole": "viewer"},
+        {"authorization": f"Bearer {api_key}", **origin_headers(base)},
+    )
+    if status not in (200, 201) or "token" not in invite:
+        raise SystemExit(f"could not invite {email} ({status}): {invite}")
+    status, session, headers = signin(base, email, secret)
+    cookie = cookie_header(headers)
+    if status != 200 or not cookie:
+        raise SystemExit(f"could not sign in {email} to accept the invite ({status}): {session}")
+    status, accepted, _ = request(
+        f"{base}/api/invites/{invite['token']}/accept",
+        "POST",
+        {"requestType": "human"},
+        {"cookie": cookie, **origin_headers(base)},
+    )
+    if status not in (200, 202):
+        raise SystemExit(f"could not accept invite for {email} ({status}): {accepted}")
+    request_id = accepted.get("id") or accepted.get("joinRequestId")
+    if not request_id:
+        print(f"  {email}: signed up; join response had no request id: {accepted}")
+        return
+    status, approved, _ = request(
+        f"{base}/api/companies/{company_id}/join-requests/{request_id}/approve",
+        "POST",
+        headers={"authorization": f"Bearer {api_key}", **origin_headers(base)},
+    )
+    if status not in (200, 201):
+        raise SystemExit(f"could not approve {email} ({status}): {approved}")
+    print(f"  {email}: viewer in company {company_id}")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--stakeholders", required=True, help="path to stakeholders.yaml")
+    parser.add_argument("--url", required=True, help="Paperclip board origin, no trailing path")
+    parser.add_argument("--api-key", help="board API key; also joins each new user as a Viewer")
+    parser.add_argument("--company", help="company id; required when the board has more than one")
+    parser.add_argument("--password", help="password for created accounts; generated when omitted")
+    args = parser.parse_args()
+    base = args.url.rstrip("/")
+    with open(args.stakeholders, encoding="utf-8") as handle:
+        emails = emails_from_stakeholders(handle.read())
+    if not emails:
+        print("no emails under roles:", file=sys.stderr)
+        return 1
+
+    chosen = args.password or password()
+    generated = args.password is None
+    created: list[str] = []
+    for email in emails:
+        name = email.split("@", 1)[0]
+        status, body, _ = signup(base, email, name, chosen)
+        if status in (200, 201):
+            created.append(email)
+            print(f"created {email}")
+        else:
+            message = json.dumps(body)
+            if status in (400, 409, 422) and "exist" in message.lower():
+                print(f"exists {email}")
+            else:
+                print(f"failed {email} ({status}): {message}", file=sys.stderr)
+                return 1
+    if generated and created:
+        print(f"password for new accounts: {chosen}")
+    elif not created:
+        print("no new accounts; password was not used")
+
+    if args.api_key and created:
+        rows = companies(base, args.api_key)
+        if args.company:
+            targets = [row for row in rows if row.get("id") == args.company]
+            if not targets:
+                print(f"company {args.company} not visible to this key", file=sys.stderr)
+                return 1
+        elif len(rows) == 1:
+            targets = rows
+        else:
+            print("pass --company; this key can see:", file=sys.stderr)
+            for row in rows:
+                print(f"  {row.get('id')}  {row.get('name')}", file=sys.stderr)
+            return 1
+        for email in created:
+            join_as_viewer(base, args.api_key, targets[0]["id"], email, chosen)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

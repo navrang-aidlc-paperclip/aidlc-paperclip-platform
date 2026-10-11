@@ -1,53 +1,95 @@
 # syntax=docker/dockerfile:1.6
 #
-# Paperclip server + AI-DLC conductor, one image.
+# Paperclip server + conductor glue, one image.
 #
 # Pilot topology (ECS Fargate): Paperclip's `claude_local` adapter runs `claude`
-# as a child process of paperclip-server, so the harness, the pinned `aidlc`
-# runtime, git and the GitHub-App credential helper all have to be in the same
-# container as the server. Moving the conductor into its own sandbox task
-# (Paperclip Kubernetes/Daytona providers) is a later hardening step and does
-# not change anything in the aidlc-workspace repo.
+# as a child process of paperclip-server, so the harness, git and the GitHub-App
+# credential helper have to be in the same container as the server. The AI-DLC
+# engine is not in this image. `aidlc-prepare-project` installs the release named
+# in that project's `.aidlc-version` the first time a checkout is prepared.
+# Projects are attached in Paperclip, one repo per project. None of them are
+# baked into this image.
 #
 # Upstream already ships: node 24, @anthropic-ai/claude-code, git, gh, jq,
 # ripgrep, python3, tini, gosu, openssh-client. We add:
-#   - the exact AI-DLC release the workspace pins (.aidlc-version)
+#   - an empty install root the prepare step fills from the project's pin
 #   - a `claude` PATH wrapper that derives AIDLC_UNATTENDED from the Paperclip
 #     wake reason (timers never mint human turns, people do)
 #   - a git credential helper that mints short-lived GitHub App tokens
-#   - a workspace bootstrap that clones aidlc-workspace + repos.json siblings
+#   - a prepare step the conductor runs inside whichever project it was woken for
 #
-# Build:  docker build --build-arg AIDLC_VERSION=2.11.0 -t aidlc-conductor conductor/
+# Build from the platform repository root:
+#   docker build -f conductor/Dockerfile -t aidlc-conductor .
 # Pin PAPERCLIP_TAG to a release tag once you have validated one; `latest`
 # moves weekly.
 
 ARG PAPERCLIP_TAG=latest
 FROM ghcr.io/paperclipai/paperclip:${PAPERCLIP_TAG}
 
-ARG AIDLC_VERSION=2.11.0
 ARG TARGETARCH
 
 USER root
 
-# ---- AI-DLC native runtime (machine-wide, outside the volume) --------------
-# The installer refuses to run as root, so it runs as the runtime user (node,
-# uid 1000) into /opt/aidlc. That root also holds the machine-local pin
-# registry (pins.json) the bootstrap writes, so node must own it. It lives in
-# the image layer, not under /paperclip (an EFS mount at runtime). The hooks
-# in .claude/settings.json call the bare `aidlc` command, so it must be on the
-# system PATH for every process the adapter spawns: ENV PATH + a symlink.
+# Paperclip's ACP launcher forwards static AWS keys only. On Fargate the task
+# role arrives as AWS_CONTAINER_CREDENTIALS_RELATIVE_URI. ecs-task-credentials
+# reads that endpoint; dropping the URI here makes every Bedrock call fail.
+RUN python3 - <<'PY'
+from pathlib import Path
+path = Path("/app/packages/adapter-utils/src/acpx-engine/execute.ts")
+text = path.read_text()
+needle = '"AWS_SHARED_CREDENTIALS_FILE"'
+keys = (
+    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+    "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+    "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+)
+missing = [key for key in keys if key not in text]
+if missing:
+    idx = text.find(needle)
+    if idx < 0:
+        raise SystemExit("Claude ACP credential allowlist anchor is missing")
+    line_start = text.rfind("\n", 0, idx) + 1
+    indent = text[line_start:idx]
+    line_end = text.find("\n", idx)
+    extra = "".join(f'\n{indent}"{key}",' for key in missing)
+    path.write_text(text[:line_end] + extra + text[line_end:])
+PY
+
+# Paperclip refuses an exclusive checkout lock for a local folder, then starts
+# the next agent beside the one already writing it. A project policy of
+# `serialize` must take the existing workspace-busy gate on this host too.
+# `auto` and `allow` stay as upstream left them.
+RUN python3 - <<'PY'
+import re
+from pathlib import Path
+needle = 'sharedWorkspaceConcurrency !== "allow" &&'
+insert = 'sharedWorkspaceConcurrency === "serialize" || sharedWorkspaceConcurrency !== "allow" &&'
+comment = re.compile(
+    r"Local/SSH folders never take an exclusive workspace lock, including when older\n"
+    r"[ \t]*// project or issue settings request serialization\."
+)
+replacement = "serialize takes the exclusive lock on a local folder too. auto still leaves local and SSH folders unlocked."
+files = (
+    Path("/app/server/src/services/heartbeat.ts"),
+    Path("/app/server/dist/services/heartbeat.js"),
+)
+for path in files:
+    text = path.read_text()
+    if text.count(needle) != 1 or len(comment.findall(text)) != 1:
+        raise SystemExit(f"workspace lock anchor missing or duplicated in {path}")
+    path.write_text(comment.sub(replacement, text, count=1).replace(needle, insert, 1))
+PY
+
+# ---- AI-DLC install root (empty until a project is prepared) ---------------
+# The installer refuses to run as root. aidlc-prepare-project runs as node and
+# fills this directory with the release named in the checkout's .aidlc-version.
+# Hooks call the bare `aidlc` command, so the bin dir is on PATH. Nothing under
+# /paperclip (the EFS mount) holds the binary. This layer does not download it.
 ENV AIDLC_INSTALL_ROOT=/opt/aidlc \
     AIDLC_BIN_DIR=/opt/aidlc/bin \
     PATH=/opt/aidlc/bin:$PATH
-RUN set -eux; \
-    mkdir -p /opt/aidlc/bin && chown -R node:node /opt/aidlc; \
-    gosu node sh -c ' \
-      set -eu; tmp="$(mktemp -d)"; \
-      curl -fsSL "https://github.com/awslabs/aidlc-workflows/releases/download/v'"${AIDLC_VERSION}"'/install.sh" -o "$tmp/install.sh"; \
-      sh "$tmp/install.sh" --version "'"${AIDLC_VERSION}"'" --yes --quiet; \
-      rm -rf "$tmp"'; \
-    ln -s /opt/aidlc/bin/aidlc /usr/local/bin/aidlc; \
-    aidlc --version
+RUN mkdir -p /opt/aidlc/bin && chown -R node:node /opt/aidlc
 
 # ---- AWS CLI (Bedrock model-access checks, Secrets Manager, ECR) ----------
 RUN set -eux; \
@@ -65,21 +107,35 @@ RUN set -eux; \
 # NOT on PATH; npm links into /usr/local/bin). Rename the real binary and put
 # the wrapper where `claude` was so Paperclip's "Test Environment" and the
 # adapter's exec both hit the wrapper.
-COPY bin/claude-wrapper.sh          /usr/local/bin/claude-wrapper
-COPY bin/git-credential-github-app  /usr/local/bin/git-credential-github-app
-COPY bin/aidlc-bootstrap-workspace  /usr/local/bin/aidlc-bootstrap-workspace
-COPY bin/aidlc-entrypoint.sh        /usr/local/bin/aidlc-entrypoint.sh
+# Build context is the platform repository root (see .github/workflows/build-conductor.yml).
+COPY conductor/bin/claude-wrapper.sh          /usr/local/bin/claude-wrapper
+COPY conductor/bin/ecs-task-credentials       /usr/local/bin/ecs-task-credentials
+COPY conductor/bin/git-credential-github-app  /usr/local/bin/git-credential-github-app
+COPY conductor/bin/aidlc-prepare-project      /usr/local/bin/aidlc-prepare-project
+COPY conductor/bin/aidlc-entrypoint.sh        /usr/local/bin/aidlc-entrypoint.sh
+COPY conductor/claude/managed-settings.json   /etc/claude-code/managed-settings.json
+COPY conductor/skills                         /opt/conductor/paperclip-skills
+COPY paperclip/agents                         /opt/conductor/paperclip-agents
+COPY paperclip/bin/provision-agents           /usr/local/bin/provision-agents
 RUN set -eux; \
-    chmod +x /usr/local/bin/claude-wrapper /usr/local/bin/git-credential-github-app \
-             /usr/local/bin/aidlc-bootstrap-workspace /usr/local/bin/aidlc-entrypoint.sh; \
+    chmod +x /usr/local/bin/claude-wrapper /usr/local/bin/ecs-task-credentials \
+             /usr/local/bin/git-credential-github-app \
+             /usr/local/bin/aidlc-prepare-project /usr/local/bin/aidlc-entrypoint.sh \
+             /usr/local/bin/provision-agents; \
+    mkdir -p /home/node/.claude; \
+    cp /etc/claude-code/managed-settings.json /home/node/.claude/settings.json; \
+    chown -R node:node /home/node/.claude; \
     real="$(readlink -f "$(command -v claude)")"; \
     rm -f /usr/local/bin/claude; \
     ln -s "$real" /usr/local/bin/claude-real; \
     ln -s /usr/local/bin/claude-wrapper /usr/local/bin/claude; \
-    claude --version
+    ver="$(claude-real --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"; \
+    VER="$ver" python3 -c 'import os,sys; v=tuple(int(x) for x in os.environ["VER"].split(".")); \
+sys.exit(0 if v >= (2, 1, 206) else 1)'; \
+    echo "claude $ver supports awsCredentialExport"
 
-# Git identity for commits the conductor makes in the record repo and the
-# source repos. Override per deployment with env.
+# Git identity for commits the conductor makes in a project checkout.
+# Override per deployment with env.
 ENV GIT_AUTHOR_NAME="aidlc-conductor" \
     GIT_AUTHOR_EMAIL="aidlc-conductor@users.noreply.github.com" \
     GIT_COMMITTER_NAME="aidlc-conductor" \
@@ -87,17 +143,13 @@ ENV GIT_AUTHOR_NAME="aidlc-conductor" \
     GIT_CONFIG_COUNT=1 \
     GIT_CONFIG_KEY_0=credential.https://github.com.helper \
     GIT_CONFIG_VALUE_0=github-app \
-    # Claude Code on Bedrock. AWS_REGION must be explicit; credentials come
-    # from the ECS task role via the container credential provider.
+    # Claude Code on Bedrock. AWS_REGION must be explicit. Task-role tokens
+    # are reloaded by awsCredentialExport before they expire.
     CLAUDE_CODE_USE_BEDROCK=1 \
     AWS_REGION=eu-central-1 \
-    DISABLE_PROMPT_CACHING=0 \
-    # Where the bootstrap puts the workspace (on the /paperclip volume so the
-    # record survives task replacement; the Paperclip agent's cwd points here).
-    AIDLC_WORKSPACES_ROOT=/paperclip/workspaces \
-    AIDLC_WORKSPACE_REPO=https://github.com/navrang-aidlc-paperclip/aidlc-workspace.git \
-    AIDLC_WORKSPACE_NAME=aidlc-workspace
+    DISABLE_PROMPT_CACHING=0
 
-# Upstream ENTRYPOINT is `tini -- docker-entrypoint.sh`; we insert our
-# bootstrap in front of the upstream entrypoint and keep its CMD.
+# Setting ENTRYPOINT clears the base image's CMD, so the server command has
+# to be restated. docker-entrypoint.sh ends in `exec gosu node "$@"`.
 ENTRYPOINT ["/usr/bin/tini", "--", "aidlc-entrypoint.sh"]
+CMD ["node", "--import", "./server/node_modules/tsx/dist/loader.mjs", "server/dist/index.js"]

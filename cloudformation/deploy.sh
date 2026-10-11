@@ -34,26 +34,42 @@ deploy_data() {
   : "${GITHUB_APP_ID:?set in deploy.env}"
   : "${GITHUB_APP_INSTALLATION_ID:?set in deploy.env}"
   : "${GITHUB_APP_PRIVATE_KEY_FILE:?path to the .pem, set in deploy.env}"
-  : "${ENTRA_CLIENT_SECRET:?set in deploy.env}"
+  # JSON file so the PEM's newlines survive. The file is removed after deploy.
+  local params
+  params="$(mktemp)"
+  NAME="$NAME" \
+  DB_INSTANCE_CLASS="${DB_INSTANCE_CLASS:-db.t4g.medium}" \
+  DB_ENGINE_VERSION="${DB_ENGINE_VERSION:-17.9}" \
+  GITHUB_APP_ID="$GITHUB_APP_ID" \
+  GITHUB_APP_INSTALLATION_ID="$GITHUB_APP_INSTALLATION_ID" \
+  GITHUB_APP_PRIVATE_KEY_FILE="$GITHUB_APP_PRIVATE_KEY_FILE" \
+  PARAMS_FILE="$params" \
+  python3 - << 'PY'
+import json, os
+values = {
+    "Name": os.environ["NAME"],
+    "DbInstanceClass": os.environ["DB_INSTANCE_CLASS"],
+    "DbEngineVersion": os.environ["DB_ENGINE_VERSION"],
+    "GitHubAppId": os.environ["GITHUB_APP_ID"],
+    "GitHubAppInstallationId": os.environ["GITHUB_APP_INSTALLATION_ID"],
+    "GitHubAppPrivateKeyPem": open(os.environ["GITHUB_APP_PRIVATE_KEY_FILE"]).read(),
+}
+params = [{"ParameterKey": k, "ParameterValue": v} for k, v in values.items()]
+with open(os.environ["PARAMS_FILE"], "w") as f:
+    json.dump(params, f)
+os.chmod(os.environ["PARAMS_FILE"], 0o600)
+PY
   aws cloudformation deploy \
     --stack-name "$(stack data)" \
     --template-file "$here/20-data.yaml" \
-    --parameter-overrides \
-      "Name=$NAME" \
-      "DbInstanceClass=${DB_INSTANCE_CLASS:-db.t4g.medium}" \
-      "DbEngineVersion=${DB_ENGINE_VERSION:-17.9}" \
-      "GitHubAppId=$GITHUB_APP_ID" \
-      "GitHubAppInstallationId=$GITHUB_APP_INSTALLATION_ID" \
-      "GitHubAppPrivateKeyPem=$(cat "$GITHUB_APP_PRIVATE_KEY_FILE")" \
-      "EntraClientSecret=$ENTRA_CLIENT_SECRET" \
+    --parameter-overrides "file://$params" \
     --no-fail-on-empty-changeset
+  rm -f "$params"
 }
 
 deploy_paperclip() {
   : "${IMAGE:?full ECR image URI incl. tag}"
-  : "${DOMAIN:?set in deploy.env}"
-  : "${ENTRA_TENANT_ID:?set in deploy.env}"
-  : "${ENTRA_CLIENT_ID:?set in deploy.env}"
+  # DOMAIN empty: HTTP on the ALB hostname. Set it when a DNS name exists.
   aws cloudformation deploy \
     --stack-name "$(stack paperclip)" \
     --template-file "$here/30-paperclip.yaml" \
@@ -61,17 +77,14 @@ deploy_paperclip() {
     --parameter-overrides \
       "Name=$NAME" \
       "Image=$IMAGE" \
-      "Domain=$DOMAIN" \
+      "Domain=${DOMAIN:-}" \
       "HostedZoneId=${HOSTED_ZONE_ID:-}" \
-      "EntraTenantId=$ENTRA_TENANT_ID" \
-      "EntraClientId=$ENTRA_CLIENT_ID" \
       "DisableSignUp=${DISABLE_SIGN_UP:-false}" \
       "DesiredCount=${DESIRED_COUNT:-1}" \
-      "BedrockPrimaryModel=${BEDROCK_PRIMARY_MODEL:-eu.anthropic.claude-opus-4-8-v1:0}" \
-      "BedrockOpusModel=${BEDROCK_OPUS_MODEL:-eu.anthropic.claude-opus-4-8-v1:0}" \
-      "BedrockSonnetModel=${BEDROCK_SONNET_MODEL:-eu.anthropic.claude-sonnet-4-6-v1:0}" \
-      "BedrockHaikuModel=${BEDROCK_HAIKU_MODEL:-eu.anthropic.claude-haiku-4-6-v1:0}" \
-      "WorkspaceRepoUrl=${WORKSPACE_REPO_URL:-https://github.com/navrang-aidlc-paperclip/aidlc-workspace.git}" \
+      "BedrockPrimaryModel=${BEDROCK_PRIMARY_MODEL:-eu.anthropic.claude-sonnet-4-6}" \
+      "BedrockOpusModel=${BEDROCK_OPUS_MODEL:-eu.anthropic.claude-sonnet-4-6}" \
+      "BedrockSonnetModel=${BEDROCK_SONNET_MODEL:-eu.anthropic.claude-sonnet-4-6}" \
+      "BedrockHaikuModel=${BEDROCK_HAIKU_MODEL:-eu.anthropic.claude-haiku-4-5-20251001-v1:0}" \
       "GitHubActionsRepo=${GITHUB_ACTIONS_REPO:-navrang-aidlc-paperclip/aidlc-platform}" \
     --no-fail-on-empty-changeset
   aws cloudformation describe-stacks --stack-name "$(stack paperclip)" \
