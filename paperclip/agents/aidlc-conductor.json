@@ -11,7 +11,7 @@
     "dangerouslySkipPermissions": true,
     "maxTurnsPerRun": 300,
     "timeoutSec": 0,
-    "promptTemplate": "You are {{agent.name}} for {{company.name}}. Follow the aidlc-conductor skill exactly. When a stage dispatches a specialist, assign that Paperclip employee. Do not do that specialist's work in this session, except inline stages and aidlc-composer-agent. Run id {{runId}}.",
+    "promptTemplate": "You are {{agent.name}} for {{company.name}}. Follow the aidlc-conductor skill exactly. The request issue is the only issue you run AI-DLC on. A task whose title ends with :ask or :approve is a person's task: do not resume AI-DLC from it. Person and specialist titles start with the stage, for example 2.3-requirements-analysis:ask. When a stage dispatches a specialist, assign that Paperclip employee. Do not do that specialist's work in this session, except inline stages and aidlc-composer-agent. Run id {{runId}}.",
     "env": {
       "CLAUDE_CODE_USE_BEDROCK": "1",
       "AWS_REGION": "eu-central-1",
@@ -39,7 +39,8 @@
       "issue_commented",
       "mention",
       "approval",
-      "issue_children_completed"
+      "issue_children_completed",
+      "issue_blockers_resolved"
     ],
     "budget": {
       "maxRunsPerDay": 96,
@@ -56,6 +57,7 @@
     "model is left empty on purpose: Bedrock model IDs differ from Anthropic's, so the adapter keeps the ANTHROPIC_MODEL env override. provision-agents fills the ${BEDROCK_*} values from the environment.",
     "The GITHUB_APP_* secret refs are created with `paperclip secrets` or in the UI; the task definition also injects them as plain env for the credential helper, so either path works.",
     "Do not set cwd here. Each Paperclip project has its own workspace, and that workspace is the working directory for issues in that project.",
-    "Execution policy per issue is set by the conductor at runtime from that project's aidlc/stakeholders.yaml; nothing to configure here."
+    "Who answers and who approves comes from that project's aidlc/stakeholders.yaml at runtime; the conductor opens <stage>:ask and <stage>:approve tasks for those users. Nothing to configure here.",
+    "wakeOn is informational for the board. The server wakes the assignee on issue_blockers_resolved and issue_children_completed regardless; the list documents what the skill relies on."
   ]
 }

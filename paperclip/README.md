@@ -81,9 +81,9 @@ on the primary checkout, one specialist at a time.
 
 ## 5. Agents
 
-The conductor and the fourteen specialists are one roster. Install them
-together. This creates the two company skills and every employee, and it
-is safe to run again.
+The conductor, the fourteen specialists, and the initializer are one
+roster. Install them together. This creates the company skills and every
+employee, and it is safe to run again.
 
 ```sh
 export BEDROCK_PRIMARY_MODEL=...   # paperclip stack output BedrockModelIds
@@ -115,12 +115,20 @@ in `eu-central-1`.
 The other fourteen employees are the specialists in `.claude/agents/`.
 Confirm in the UI that each has **no scheduled heartbeat**. A timer must
 not start one. They wake only when the conductor assigns a child issue.
+`aidlc-initializer` also has no heartbeat. It is not a specialist. A
+person assigns it a task on a project that already has repositories
+attached. It asks which repository holds the AI-DLC files and which
+hold source (those can be the same repository), which release to
+install, who holds each stakeholder role, and the vision and intent.
+It writes `repos.json`, installs that release, writes
+`aidlc/stakeholders.yaml`, and pushes. It does not start an intent.
 `aidlc-composer-agent` is on the roster so it matches `.claude/agents`;
 the conductor does not assign it. Compose stays in the conductor session.
 
 | Employee | Skill |
 | --- | --- |
 | `aidlc-conductor` | `aidlc-conductor` |
+| `aidlc-initializer` | `aidlc-initializer` |
 | every `aidlc-*-agent` | `aidlc-specialist` |
 
 ## 6. Issue template
@@ -131,41 +139,56 @@ Create an issue template **AI-DLC workflow** with:
 - Body: the request in prose, optional links to uploaded documents
 - Labels: `scope:<name>` (optional), `aidlc`
 - Default assignee: `aidlc-conductor`
-- No stage gate on the template. The conductor posts an Approve card on
-  each stage issue.
+- No stage gate on the template. The conductor opens a task ending in
+  `:approve` for the approver at each gate. The Execution tab names that
+  approver. There is no Approve card.
 
 ## 7. Smoke run
 
 1. Upload a one-paragraph vision doc to the project's Documents.
 2. Create an issue on that project from the template: "Build a hello-world
-   HTTP service", label `scope:poc`.
+   HTTP service", label `scope:poc`. This is the **request**. It is the
+   only issue the conductor runs AI-DLC on, and it stays assigned to the
+   conductor until the intent is finished.
 3. Expect within one heartbeat: a comment "Intent ... created" on the
-   request issue, then a new stage issue for intent-capture (title starts
-   with `stage:`, assigned to the conductor, no parent). Questions are an
-   `ask_user_questions` interaction on that stage issue, addressed to the
-   product owner and the initiator. The request issue does not carry the
-   questions.
-4. Submit that question card as the product owner or the initiator. The
-   conductor records it, copies the review markdown onto the stage issue as
-   a document, and posts an Approve card in the same thread with that text.
-   Click Approve on that card. Expect that stage issue `done` and a new
-   stage issue for the next stage.
-5. A Viewer who is not an addressee cannot submit the question card (403).
-   An ordinary comment is not an answer, and the board does not 422 it.
-   The conductor records that comment as a note.
-6. Only a member of the stage's approver role can accept the approval
-   stage. A comment that says "approve" from anyone else does not open the
-   gate.
+   request, a goal on it, a document `AI-DLC progress` on it, the record
+   committed and pushed, and only then a task `1.1-intent-capture:ask`.
+   The conductor creates that task assigned to itself, blocks the request
+   on it, and stops. A second run, bound to the ask task, posts the
+   question card there and reassigns the task to the product owner (the
+   first `answers` role in `stakeholders.yaml`). The request never carries
+   the question card. Its description names the stage's answers, approver,
+   and reviewer from `stakeholders.yaml`.
+4. Answer the card on the ask task as that user, then set the task to
+   **Done**. Expect the request to wake (`issue_blockers_resolved`),
+   record the answers, and open `1.1-intent-capture:approve`. The review
+   markdown (`intent-statement`) is a document on the request. The approve
+   task's Execution tab names the approver from `stakeholders.yaml`. A
+   stage whose `reviewer` is set shows that reviewer as the first stage on
+   the same tab. There is no Approve card.
+5. As the approver, set the task to **Done**. That is the approval. A
+   comment is not required, and the status control cannot attach one.
+   Expect the task to be `done`
+   immediately, then the request to leave `blocked`, resume AI-DLC, and
+   either open the next `:ask` or `:approve` task or assign a specialist
+   child (`<number>-<slug>:<seq>:<agent>:<role>`) under the request. Another
+   board user cannot complete the stage.
+6. Request changes: set the status to **In progress**. Do not also set
+   Done. A comment can explain the reason. The conductor closes
+   the task, redoes the stage, and opens a fresh `:approve` task.
+7. A Viewer who is not an addressee cannot submit a question card (403).
+   An ordinary comment on a task is not an answer; the conductor replies
+   once that answers go on the card. A comment that says "approve" does
+   not open the gate.
+8. Forgetting Done on an answered question card, or on an approval whose
+   execution stage is already completed, is closed by the conductor's
+   30-minute timer sweep. A stage that is still pending is not.
 
 This project is one intent. Issue titles do not repeat the record directory.
-
-Creating the intent also creates a task-level goal on the request issue.
-When the approver accepts the unit plan, the goal gains one unassigned card
-per unit, titled `unit:<unit>`. Each card is the parent of that unit's
-Construction stages `stage:3.1-functional-design:<unit>` through
-`stage:3.5-code-generation:<unit>`, created up front so the board sorts by
-stage number. `stage:3.6-build-and-test` and `stage:3.7-ci-pipeline` have
-no parent. Questions and approvals stay on the stage issue. Specialist
-children are children of that stage issue.
+There are no `stage:` or `unit:` issues any more; a stage shows up on the
+board only when it needs a person (`2.3-requirements-analysis:ask`,
+`2.3-requirements-analysis:approve`) or a specialist
+(`3.5-code-generation:1:aidlc-developer-agent:lead`). Progress for the whole intent is the `AI-DLC progress`
+document on the request.
 
 This smoke run is the first checklist item in the master plan (gating seam).

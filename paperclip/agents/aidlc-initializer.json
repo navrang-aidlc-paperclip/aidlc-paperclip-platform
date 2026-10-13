@@ -1,0 +1,58 @@
+{
+  "name": "aidlc-initializer",
+  "title": "AI-DLC initializer",
+  "role": "general",
+  "icon": "wand",
+  "capabilities": "Sets up a project that already has repositories attached: asks which repo holds the AI-DLC files and which hold source, which release to install, who the stakeholders are, and the vision and intent.",
+  "adapterType": "claude_local",
+  "adapterConfig": {
+    "mode": "persistent",
+    "model": "",
+    "dangerouslySkipPermissions": true,
+    "maxTurnsPerRun": 80,
+    "timeoutSec": 0,
+    "promptTemplate": "You are {{agent.name}} for {{company.name}}. Follow the aidlc-initializer skill exactly. Do not follow the aidlc-conductor skill or the aidlc-specialist skill. You set up a blank repository. You do not start an AI-DLC intent. Run id {{runId}}.",
+    "env": {
+      "CLAUDE_CODE_USE_BEDROCK": "1",
+      "AWS_REGION": "eu-central-1",
+      "ANTHROPIC_MODEL": "${BEDROCK_PRIMARY_MODEL}",
+      "ANTHROPIC_DEFAULT_OPUS_MODEL": "${BEDROCK_OPUS_MODEL}",
+      "ANTHROPIC_DEFAULT_SONNET_MODEL": "${BEDROCK_SONNET_MODEL}",
+      "ANTHROPIC_DEFAULT_HAIKU_MODEL": "${BEDROCK_HAIKU_MODEL}",
+      "DISABLE_PROMPT_CACHING": "0",
+      "AIDLC_INSTALL_ROOT": "/opt/aidlc",
+      "AIDLC_BIN_DIR": "/opt/aidlc/bin",
+      "GITHUB_APP_ID": {
+        "secretRef": "github-app-id"
+      },
+      "GITHUB_APP_INSTALLATION_ID": {
+        "secretRef": "github-app-installation-id"
+      },
+      "GITHUB_APP_PRIVATE_KEY": {
+        "secretRef": "github-app-private-key"
+      }
+    }
+  },
+  "runtime": {
+    "maxConcurrentRuns": 1,
+    "heartbeatIntervalSec": null,
+    "wakeOn": [
+      "issue_assigned",
+      "issue_commented"
+    ],
+    "budget": {
+      "maxRunsPerDay": 24,
+      "maxRunMinutes": 60
+    }
+  },
+  "skills": [
+    "aidlc-initializer"
+  ],
+  "_notes": [
+    "Installed with the others by paperclip/bin/provision-agents. A person assigns this employee a task on a blank repository. The conductor does not dispatch it.",
+    "No heartbeat. It wakes when the task is assigned, and again when the person answers a question card on that task.",
+    "model is empty on purpose. provision-agents fills the ${BEDROCK_*} values from the environment.",
+    "Do not set cwd. The task's project workspace is the repository being set up.",
+    "GitHub App secrets are required because this employee commits and pushes the setup. The conductor is not in this loop."
+  ]
+}

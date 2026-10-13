@@ -81,6 +81,38 @@ for path in files:
     path.write_text(comment.sub(replacement, text, count=1).replace(needle, insert, 1))
 PY
 
+# The board status control and the comment box are separate requests. An
+# execution stage must be completable by setting Done, without a comment in
+# that same request. A comment left earlier is not that request.
+RUN python3 - <<'PY'
+import re
+from pathlib import Path
+approve_gate = re.compile(
+    r"[ \t]*if \(!input\.commentBody\?\.trim\(\)\) \{\n"
+    r"[ \t]*throw unprocessable\(`Approving a review or approval stage requires a comment\. \$\{STAGE_DECISION_COMMENT_HINT\}`\);\n"
+    r"[ \t]*\}\n"
+)
+changes_gate = re.compile(
+    r"[ \t]*if \(!input\.commentBody\?\.trim\(\)\) \{\n"
+    r"[ \t]*throw unprocessable\(`Requesting changes requires a comment\. \$\{STAGE_DECISION_COMMENT_HINT\}`\);\n"
+    r"[ \t]*\}\n"
+)
+body = re.compile(r"body: input\.commentBody\.trim\(\),")
+files = (
+    Path("/app/server/src/services/issue-execution-policy.ts"),
+    Path("/app/server/dist/services/issue-execution-policy.js"),
+)
+for path in files:
+    text = path.read_text()
+    if len(approve_gate.findall(text)) != 1 or len(changes_gate.findall(text)) != 1 or len(body.findall(text)) != 3:
+        raise SystemExit(f"execution comment gate anchor missing or duplicated in {path}")
+    text = approve_gate.sub("", text, count=1)
+    text = changes_gate.sub("", text, count=1)
+    text = body.sub('body: input.commentBody?.trim() || "Approved",', text, count=2)
+    text = body.sub('body: input.commentBody?.trim() || "Changes requested",', text, count=1)
+    path.write_text(text)
+PY
+
 # ---- AI-DLC install root (empty until a project is prepared) ---------------
 # The installer refuses to run as root. aidlc-prepare-project runs as node and
 # fills this directory with the release named in the checkout's .aidlc-version.
